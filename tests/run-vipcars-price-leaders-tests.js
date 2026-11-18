@@ -87,11 +87,11 @@ async function testPaginationStopsWithoutFetchingLaterPages() {
   console.log("PASS pagination stops at the price leaders without fetching later pages");
 }
 
-function card(id, provider, price) {
+function card(id, provider, price, payNow = price / 10) {
   return `<article class="scv-car-box" id="${id}">
     <div class="scv-supp-info"><img alt="${provider}"></div>
     <div class="scv-car-name">Fixture car</div><div class="scv-car-cat">Economy</div>
-    <div class="scv-new-amount">EUR ${price.toFixed(2)}</div><div class="scv-pay-now">Pay Now EUR ${(price / 10).toFixed(2)}</div>
+    <div class="scv-new-amount">EUR ${price.toFixed(2)}</div><div class="scv-pay-now">Pay Now EUR ${payNow.toFixed(2)}</div>
     <ul class="scv-car-specs"><li><i class="scv-icon autom"></i>Automatic transmission</li></ul>
   </article>`;
 }
@@ -101,7 +101,7 @@ function pageHtml(cards, nextOffset, nextPage, total) {
     $("#car_count_data").val(${total});</script>`;
 }
 
-function bootstrap(urls, ownCheckbox, ownTotal) {
+function bootstrap(urls, ownCheckbox, ownTotal, { lateOwn = false, ownSliderMin = 0 } = {}) {
   return `<!doctype html><style>.scv-car-box{display:block;width:240px;height:80px}</style>
     <input id="pickup_country" value="119"><input id="dropoff_country" value="119">
     <input id="pickup_city" value="1744"><input id="dropoff_city" value="1744">
@@ -111,7 +111,9 @@ function bootstrap(urls, ownCheckbox, ownTotal) {
     <input name="currency" value="EUR"><input id="page_busy" value="1">
     <input id="price_range" value="0,1000" data-slider-min="0" data-slider-max="1000">
     <input id="filter_automatic" type="checkbox">
+    ${ownCheckbox === "fieldset-disabled" ? "<fieldset disabled>" : ""}
     ${ownCheckbox ? `<input id="supplier_checkbox_mm_cars_rental" type="checkbox" value="mm_cars_rental"${ownCheckbox === "disabled" ? " disabled" : ""}>` : ""}
+    ${ownCheckbox === "fieldset-disabled" ? "</fieldset>" : ""}
     <span id="car_count_data">8</span><div id="results"></div>
     <script>
       window.SITE_URL = 'https://be.supplycars.com/be1';
@@ -122,15 +124,24 @@ function bootstrap(urls, ownCheckbox, ownTotal) {
         params.delete('load_type');
         return params.toString();
       };
-      const show = async (url, total) => {
+      const show = async (url, total, late = false) => {
         document.getElementById('page_busy').value = '1';
         const response = await fetch(url);
-        document.getElementById('results').innerHTML = await response.text();
+        const html = await response.text();
+        const results = document.getElementById('results');
         document.getElementById('car_count_data').textContent = total;
         document.getElementById('page_busy').value = '0';
+        if (!late) { results.innerHTML = html; return; }
+        const parsed = new DOMParser().parseFromString(html, 'text/html');
+        const cards = [...parsed.querySelectorAll('.scv-car-box')];
+        results.innerHTML = cards[0].outerHTML;
+        setTimeout(() => { results.innerHTML = html; }, 1500);
       };
       document.getElementById('filter_automatic').addEventListener('change', () => show(${JSON.stringify(urls.automatic)}, 8));
-      document.getElementById('supplier_checkbox_mm_cars_rental')?.addEventListener('change', () => show(${JSON.stringify(urls.own)}, ${ownTotal}));
+      document.getElementById('supplier_checkbox_mm_cars_rental')?.addEventListener('change', () => {
+        document.getElementById('price_range').setAttribute('data-slider-min', '${ownSliderMin}');
+        show(${JSON.stringify(urls.own)}, ${ownTotal}, ${lateOwn});
+      });
       show(${JSON.stringify(urls.initial)}, 8);
     </script>`;
 }
@@ -156,16 +167,28 @@ const AUTOMATIC_PAGES = {
     [card("e1", "E", 70), card("e2", "E", 80)]
   ]
 };
+AUTOMATIC_PAGES["own-tie-paynow"] = [...SORTED.slice(0, 3),
+  [card("m1", "MM Cars Rental", 60, 6), card("m2", "MM Cars Rental", 60, 12)]];
+
 // The own-supplier filter must describe the same result set as the sorted list above.
 const OWN_PAGES = {
   sorted: [[card("m1", "MM Cars Rental", 60), card("m2", "MM Cars Rental", 65)]],
   "contradicting-own": [[card("m1", "MM Cars Rental", 25), card("m2", "MM Cars Rental", 65)]],
-  "foreign-own": [[card("a1", "A", 20), card("m2", "MM Cars Rental", 65)]]
+  "foreign-own": [[card("a1", "A", 20), card("m2", "MM Cars Rental", 65)]],
+  "duplicate-id-own": [[card("d1", "MM Cars Rental", 60), card("m2", "MM Cars Rental", 65)]],
+  "own-tie-paynow": [[card("m2", "MM Cars Rental", 60, 12), card("m1", "MM Cars Rental", 60, 6)]],
+  "own-empty": [[]],
+  "own-wrong-range": [[card("m2", "MM Cars Rental", 65)]]
 };
-const FULL_PAGINATION = ["unsorted", "no-own-checkbox", "disabled-own-checkbox", "double-sort"];
+const FULL_PAGINATION = ["unsorted", "no-own-checkbox", "disabled-own-checkbox", "fieldset-disabled-own", "double-sort"];
+const REJECTED = { "contradicting-own": /contradict/, "foreign-own": /another supplier/,
+  "duplicate-id-own": /contradict/, "own-wrong-range": /changes the search/ };
 
 async function runCase(browser, scenario) {
-  const ownCheckbox = scenario === "no-own-checkbox" ? null : scenario === "disabled-own-checkbox" ? "disabled" : "enabled";
+  const checkboxStates = { "no-own-checkbox": null, "disabled-own-checkbox": "disabled",
+    "fieldset-disabled-own": "fieldset-disabled" };
+  const ownCheckbox = scenario in checkboxStates ? checkboxStates[scenario] : "enabled";
+  if (scenario === "own-empty") AUTOMATIC_PAGES[scenario] = [...SORTED.slice(0, 3), [card("e1", "E", 70), card("e2", "E", 80)]];
   const automaticPages = AUTOMATIC_PAGES[scenario] || AUTOMATIC_PAGES.sorted;
   const ownPages = OWN_PAGES[scenario] || OWN_PAGES.sorted;
   const artifactsDir = fs.mkdtempSync(path.join(os.tmpdir(), "vipcars-leaders-test-"));
@@ -193,6 +216,7 @@ async function runCase(browser, scenario) {
   params.delete("offset"); params.delete("car_page");
   const automatic = `https://be.supplycars.com/be1/node.php?${params}`;
   params.set("supplier_checks", "mm_cars_rental");
+  if (scenario === "own-wrong-range") params.set("price_range", "63,1000");
   const own = `https://be.supplycars.com/be1/node.php?${params}`;
   const requests = [];
   const adapter = { async newContext(options) {
@@ -205,7 +229,8 @@ async function runCase(browser, scenario) {
         continue: async () => {
           const url = route.request().url();
           if (url === searchUrl) return route.fulfill({ status: 200, contentType: "text/html",
-            body: bootstrap({ initial, automatic, own }, ownCheckbox, ownPages.flat().length) });
+            body: bootstrap({ initial, automatic, own }, ownCheckbox, ownPages.flat().length,
+              { lateOwn: scenario === "own-late-render", ownSliderMin: scenario === "own-wrong-range" ? 63 : 0 }) });
           const source = parseResultRequest(url, { includeFiltered: true });
           if (!source) return route.abort("aborted");
           if (route.request().method() === "OPTIONS") {
@@ -220,7 +245,9 @@ async function runCase(browser, scenario) {
             const index = source.params.has("offset") ? Number(source.params.get("offset")) / 2 : 0;
             requests.push(`${ownRequest ? "own" : "automatic"}:${index}`);
             html = ownRequest
-              ? pageHtml(ownPages[index], (index + 1) * 2, index + 1, ownPages.flat().length)
+              ? (ownPages.flat().length
+                ? pageHtml(ownPages[index], (index + 1) * 2, index + 1, ownPages.flat().length)
+                : '<div class="notFoundImg"><img alt="No Results Found" width="200" height="200"></div>')
               : pageHtml(automaticPages[index], (index + 1) * 2, index + 1, 8);
           }
           return route.fulfill({ status: 200, contentType: "text/html",
@@ -231,18 +258,34 @@ async function runCase(browser, scenario) {
   } };
   try {
     let timing;
+    if (scenario === "own-tie-paynow") {
+      // Equal cheapest MM offers with different Pay Now: the retry uses full pagination, which keeps
+      // the main list's first offer exactly as before price leaders existed.
+      const result = await scraper.runLocationWithRetries(adapter, "Warsaw", { maxAttemptsPerCheck: 2 });
+      assert.equal(result.ok, true, result.error?.message);
+      assert.deepEqual(requests, ["automatic:0", "automatic:1", "automatic:2", "own:0",
+        "automatic:0", "automatic:1", "automatic:2", "automatic:3"]);
+      const mm = result.results.find((row) => row.provider === "MM Cars Rental");
+      assert.equal(mm.pay_now_amount, 6);
+      assert.equal(mm.source, "search");
+      console.log(`PASS price leaders workflow: ${scenario}`);
+      return;
+    }
     const result = await scraper.runSingleLocation(adapter, "Warsaw", { onDiagnostics: (value) => { timing = value; } });
-    if (scenario === "contradicting-own" || scenario === "foreign-own") {
-      assert.equal(result.ok, false, "contradicting or foreign own-supplier offers must not be priced");
+    if (REJECTED[scenario]) {
+      assert.equal(result.ok, false, "inconsistent own-supplier offers must not be priced");
       assert.equal(result.error.code, "RESULT_TRANSPORT_INVALID");
-      assert.match(result.error.message, scenario === "foreign-own" ? /another supplier/ : /contradict/);
+      assert.match(result.error.message, REJECTED[scenario]);
       assert.deepEqual(requests, ["automatic:0", "automatic:1", "automatic:2", "own:0"]);
       console.log(`PASS price leaders workflow: ${scenario}`);
       return;
     }
     assert.equal(result.ok, true, result.error?.message);
     const byProvider = Object.fromEntries(result.results.map((row) => [row.provider, row]));
-    if (scenario === "sorted") {
+    if (scenario === "own-empty") {
+      assert.deepEqual(requests, ["automatic:0", "automatic:1", "automatic:2", "own:0"]);
+      assert.deepEqual(Object.keys(byProvider).sort(), ["A", "B", "C", "D"], "a confirmed empty filter means no MM offer");
+    } else if (scenario === "sorted" || scenario === "own-late-render") {
       assert.deepEqual(requests, ["automatic:0", "automatic:1", "automatic:2", "own:0"]);
       assert.deepEqual(Object.keys(byProvider).sort(), ["A", "B", "C", "D", "MM Cars Rental"]);
       assert.equal(byProvider["MM Cars Rental"].total_price, 60);
@@ -301,6 +344,9 @@ function testReportKeepsOwnPriceButNoRankBeyondLeaders() {
   assert.match(cells, /30\.00 EUR\/day/, "the exact MM Cars Rental price stays visible");
   assert.doesNotMatch(cells, /Top 4/);
   assert.equal([...cells.matchAll(/MM Cars Rental/g)].length, 0, "the own offer is not placed in a Top column");
+  assert.match(html, /data-mm-state="beyond-leaders"/);
+  assert.match(html, /MM close: 0 \| MM top1 gap: 0 \| MM poza czołówką: 1/,
+    "an unknown gap is counted separately, not as a confirmed absence of close rivals");
   console.log("PASS report keeps the own price but no rank beyond the price leaders");
 }
 
@@ -315,8 +361,9 @@ async function main() {
   testReportKeepsOwnPriceButNoRankBeyondLeaders();
   const browser = await chromium.launch({ headless: true });
   try {
-    for (const scenario of ["sorted", "own-in-leaders", "unsorted", "no-own-checkbox", "disabled-own-checkbox",
-      "double-sort", "contradicting-own", "foreign-own"]) await runCase(browser, scenario);
+    for (const scenario of ["sorted", "own-in-leaders", "own-late-render", "own-empty", "unsorted", "no-own-checkbox",
+      "disabled-own-checkbox", "fieldset-disabled-own", "double-sort", "contradicting-own", "foreign-own",
+      "duplicate-id-own", "own-wrong-range", "own-tie-paynow"]) await runCase(browser, scenario);
   } finally { await browser.close(); }
 }
 

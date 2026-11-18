@@ -314,5 +314,6 @@ module.exports = {
   applyAutomaticTransmissionFilter,
   applySupplierFilter,
   loadSearchResultCards,
+  readResultState,
   waitForSearchOutcome
 };

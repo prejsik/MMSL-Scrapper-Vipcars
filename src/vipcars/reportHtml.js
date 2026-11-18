@@ -278,7 +278,7 @@ function mmOfferSummary(offers) {
   if (offer.source === OWN_FILTER_SOURCE) {
     // Fetched through the supplier filter beyond the collected leaders: the price is exact,
     // but uncollected competitors may be cheaper, so the rank stays unknown.
-    return { offer, rankLabel: "Poza czołówką", cheaperOffers: "Brak danych", state: "normal", className: "mm" };
+    return { offer, rankLabel: "Poza czołówką", cheaperOffers: "Brak danych", state: "beyond-leaders", className: "mm" };
   }
   const className = mmClassName(offer, offers);
   let state = "normal";
@@ -440,7 +440,9 @@ function reportSummary(scenarios) {
     locationCheckCount: locationGroups.length,
     missingMmCount: mmStates.filter((state) => state === "missing").length,
     closeMmCount: mmStates.filter((state) => state === "close").length,
-    top1GapCount: mmStates.filter((state) => state === "top1-gap").length
+    top1GapCount: mmStates.filter((state) => state === "top1-gap").length,
+    // Gap to the next-higher competitor is unknown here, so these are neither close nor normal.
+    beyondLeadersCount: mmStates.filter((state) => state === "beyond-leaders").length
   };
 }
 
@@ -481,6 +483,7 @@ function buildHtmlReport(rows, generatedAt = new Date().toISOString(), coverageR
     { value: "pending", text: "Oczekujące" },
     { value: "top1-gap", text: "Top1: przewaga ponad 2,5 EUR/d" },
     { value: "close", text: "Do 2,5 EUR/d od wyższej pozycji" },
+    { value: "beyond-leaders", text: "MM poza czołówką (pozycja nieznana)" },
     { value: "normal", text: "Pozostałe" }
   ]);
   return `<!doctype html>
@@ -655,7 +658,7 @@ function buildHtmlReport(rows, generatedAt = new Date().toISOString(), coverageR
 <body>
   <h1>VipCars report</h1>
   <div class="meta">Generated at: ${escapeHtml(generatedAt)} | Time zone: Europe/Warsaw | Source: https://www.vipcars.com</div>
-  <div class="summary">Scenariusze: ${summary.scenarioCount} | sprawdzenia lokalizacji: ${summary.locationCheckCount} | brak MM Cars Rental: ${summary.missingMmCount} | MM close: ${summary.closeMmCount} | MM top1 gap: ${summary.top1GapCount}${coverageSummary}</div>
+  <div class="summary">Scenariusze: ${summary.scenarioCount} | sprawdzenia lokalizacji: ${summary.locationCheckCount} | brak MM Cars Rental: ${summary.missingMmCount} | MM close: ${summary.closeMmCount} | MM top1 gap: ${summary.top1GapCount} | MM poza czołówką: ${summary.beyondLeadersCount}${coverageSummary}</div>
   ${coverageWarning}
   <div class="legend">
     <span><span class="badge">MM Cars Rental</span> MM Cars Rental in table</span>

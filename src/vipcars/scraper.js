@@ -20,6 +20,7 @@ const {
 } = require("./utils");
 
 const MAX_TIMEOUT_RETRIES = 2;
+const PRICE_LEADERS_AMBIGUOUS = "PRICE_LEADERS_AMBIGUOUS";
 
 class VipCarsScraper {
   constructor(config) {
@@ -30,6 +31,8 @@ class VipCarsScraper {
     this.config = config;
     this.attemptCounts = new Map();
     this.cooldown = { until: 0 };
+    // Checks whose price leaders were ambiguous retry with full pagination.
+    this.fullPaginationKeys = new Set();
   }
 
   async run(onProgress, options = {}) {
@@ -105,8 +108,9 @@ class VipCarsScraper {
       counts.set(key, attempts + 1);
       outcome = await this.runSingleLocation(browser, location, {
         attempt: attempts + 1, deadlineAt, cooldown, onCooldown: options.onCooldown, cooldownWaitMs,
-        onDiagnostics: options.onDiagnostics
+        onDiagnostics: options.onDiagnostics, fullPagination: this.fullPaginationKeys.has(key)
       });
+      if (outcome.error?.code === PRICE_LEADERS_AMBIGUOUS) this.fullPaginationKeys.add(key);
       outcome.attempts = attempts + 1;
       outcome.retryable = !outcome.ok && outcome.attempts < maxAttempts
         && Date.now() < deadlineAt && (outcome.error?.retryable === true || isTimeoutError(outcome.error));
@@ -256,8 +260,10 @@ class VipCarsScraper {
             () => bounded(Promise.resolve().then(action)), { aggregate: true, ...extra }) };
         // Price leaders need the own-supplier filter to fetch MM Cars Rental's offers when they sit
         // beyond the leaders; without that filter on the page, the search keeps full pagination.
-        const leaderGate = this.config.priceLeaders && automaticApplied && !filteredEmpty && !this.config.vehicleCategory
-          && await bounded(page.locator(`#supplier_checkbox_${OWN_SUPPLIER_ID}:not([disabled])`).count()) > 0
+        const ownFilter = page.locator(`#supplier_checkbox_${OWN_SUPPLIER_ID}`);
+        const leaderGate = this.config.priceLeaders && !options.fullPagination && automaticApplied && !filteredEmpty
+          && !this.config.vehicleCategory
+          && await bounded(ownFilter.count()) === 1 && await bounded(ownFilter.isEnabled())
           ? createPriceLeaderGate({ durationDays: Number(this.config.currentDurationDays || 1) })
           : null;
         // TIMING reports the pages of both searches: the own-supplier pass adds to the leaders' count.
@@ -270,9 +276,10 @@ class VipCarsScraper {
             } })));
         if (leaderGate?.state.stopped && !leaderGate.state.ownSeen) {
           const own = await diagnostics.measure("own_offers", () => bounded(this.loadOwnSupplierOffers(
-            context, page, location, { ...networkOptions,
+            context, page, location, { ...networkOptions, baseSource: captured.source,
               onState: (state) => diagnostics.recordResultState({ ...state, pageCount: (state?.pageCount ?? 0) + leaderPages }) })));
-          assertOwnOffersFollowLeaders(own, raw.length, leaderGate.state);
+          assertOwnOffersFollowLeaders(own, raw, leaderGate.state);
+          assertOwnCheapestIsUnambiguous(own);
           raw = raw.concat(own);
         }
       } else {
@@ -385,6 +392,19 @@ class VipCarsScraper {
       if (options.ownSupplier && !filtered) {
         throw transport.transportError("Own-supplier result request is not filtered.");
       }
+      if (options.ownSupplier) {
+        // The supplier filter may differ from the leaders' search only by the supplier and the cursor.
+        const base = options.baseSource;
+        const ignored = new Set(["supplier_checks", "offset", "car_page", "_"]);
+        const baseUrl = base ? new URL(base.url) : null;
+        const ownUrl = new URL(captured.source.url);
+        const fields = new Set([...(base?.params.keys() || []), ...captured.source.params.keys()]);
+        if (!base || baseUrl.origin !== ownUrl.origin || baseUrl.pathname !== ownUrl.pathname
+            || [...fields].some((field) => !ignored.has(field)
+              && JSON.stringify(base.params.getAll(field)) !== JSON.stringify(captured.source.params.getAll(field)))) {
+          throw transport.transportError("MM Cars Rental request changes the search or its filters.");
+        }
+      }
       if (filtered) {
         const specs = captured.source.params.getAll("specs_checks");
         const suppliers = captured.source.params.getAll("supplier_checks").filter(Boolean);
@@ -426,15 +446,25 @@ class VipCarsScraper {
       });
       const initial = await parsePage(captured.html);
       await measure("network_dom_parity", async () => {
-        const visible = await page.evaluate(readOfferCards, { location });
-        transport.compareVisibleCards(initial.cards, visible);
-        const visibleCounts = await page.evaluate(() => ["car_count_data", "car_count"]
-          .map((id) => {
-            const element = document.getElementById(id);
-            return String(element?.value ?? element?.textContent ?? "").trim();
-          }).filter(Boolean));
-        if (!visibleCounts.length || visibleCounts.some((value) => !/^\d+$/.test(value) || Number(value) !== initial.totalCount)) {
-          throw transport.transportError("Result response and visible DOM total counts differ.");
+        // A filter clicked after the page settled may still be rendering its first page; such a
+        // caller waits, within the attempt deadline, until the view matches the captured response.
+        while (true) {
+          try {
+            const visible = await page.evaluate(readOfferCards, { location });
+            transport.compareVisibleCards(initial.cards, visible);
+            const visibleCounts = await page.evaluate(() => ["car_count_data", "car_count"]
+              .map((id) => {
+                const element = document.getElementById(id);
+                return String(element?.value ?? element?.textContent ?? "").trim();
+              }).filter(Boolean));
+            if (!visibleCounts.length || visibleCounts.some((value) => !/^\d+$/.test(value) || Number(value) !== initial.totalCount)) {
+              throw transport.transportError("Result response and visible DOM total counts differ.");
+            }
+            return;
+          } catch (error) {
+            if (!options.awaitParity || error.code !== "RESULT_TRANSPORT_INVALID" || Date.now() >= options.deadlineAt) throw error;
+            await page.waitForTimeout(200);
+          }
         }
       });
       const paginationSource = await measure("network_prep", () => initial.cards.length < initial.totalCount
@@ -477,8 +507,7 @@ class VipCarsScraper {
   async loadOwnSupplierOffers(context, page, location, options) {
     const deadlineAt = options.deadlineAt ?? Date.now() + (this.config.attemptBudgetMs || 180000);
     // Listen before the click: a page without a busy indicator already shows automatic cards,
-    // so only the filtered response and the view it renders prove the filter took effect.
-    const before = (await page.evaluate(readOfferCards, { location })).map((card) => card.cardId).join("|");
+    // so only the filtered response, and a view that matches it, prove the filter took effect.
     const capture = transport.captureInitialResults(page, { filtered: true });
     try {
       const applied = await readiness.applySupplierFilter(page, OWN_SUPPLIER_ID, { timeoutMs: this.config.timeoutMs, ...options });
@@ -488,9 +517,10 @@ class VipCarsScraper {
         if (Date.now() >= deadlineAt) throw transport.transportError("MM Cars Rental filtered response was not captured.", true);
         await page.waitForTimeout(200);
       }
-      const filteredEmpty = await this.waitForOwnSupplierView(page, location, deadlineAt, before);
+      const responseEmpty = !/class=["'][^"']*\bscv-car-box\b/.test(captured.html);
+      if (responseEmpty) await this.confirmEmptyView(page, location, deadlineAt);
       const cards = await this.loadNetworkOffers(context, page, captured, location,
-        { ...options, filteredEmpty, ownSupplier: OWN_SUPPLIER_ID });
+        { ...options, filteredEmpty: responseEmpty, awaitParity: true, ownSupplier: OWN_SUPPLIER_ID });
       console.log(`    MM Cars Rental offers: ${cards.length} (supplier filter).`);
       return cards.map((card) => ({ ...card, offerSource: OWN_FILTER_SOURCE }));
     } finally {
@@ -498,21 +528,16 @@ class VipCarsScraper {
     }
   }
 
-  // Waits until the filtered view replaces the pre-click cards; the supplier of every card is
-  // then checked against the network response, so a wrong supplier fails fast instead of waiting.
-  async waitForOwnSupplierView(page, location, deadlineAt, before) {
+  // An empty filtered response proves MM Cars Rental's absence only when the page agrees: no
+  // offer cards in the DOM and a visible no-results state once loading has finished.
+  async confirmEmptyView(page, location, deadlineAt) {
     while (true) {
-      const view = await page.evaluate(() => {
-        const busy = String(document.getElementById("page_busy")?.value ?? "").trim().toLowerCase();
-        const empty = document.querySelector('.notFoundImg img[alt="No Results Found"]');
-        return { busy: ["1", "true", "busy", "loading"].includes(busy), noResults: Boolean(empty?.getClientRects().length) };
-      });
-      if (!view.busy) {
-        if (view.noResults) return true;
-        const visible = await page.evaluate(readOfferCards, { location });
-        if (visible.length && visible.map((card) => card.cardId).join("|") !== before) return false;
+      const state = await readiness.readResultState(page);
+      const cards = await page.evaluate(readOfferCards, { location });
+      if (!state.busy && state.noResults && state.cardCount === 0 && cards.length === 0) return;
+      if (Date.now() >= deadlineAt) {
+        throw transport.transportError("MM Cars Rental empty result does not match the page.", true);
       }
-      if (Date.now() >= deadlineAt) throw transport.transportError("MM Cars Rental results did not appear.", true);
       await page.waitForTimeout(200);
     }
   }
@@ -636,11 +661,27 @@ function dedupeOffers(offers) {
 // MM Cars Rental was absent from the collected sorted prefix, so all of its offers must fit in the
 // uncollected remainder and cost at least as much as the last collected offer. Anything else means
 // the two responses describe different result sets, and the attempt must not be priced.
-function assertOwnOffersFollowLeaders(ownCards, collectedCount, leaders) {
-  const uncollected = Number(leaders.totalCount) - collectedCount;
+function assertOwnOffersFollowLeaders(ownCards, leaderCards, leaders) {
+  const uncollected = Number(leaders.totalCount) - leaderCards.length;
+  const leaderIds = new Set(leaderCards.map((card) => card.cardId));
   if (!Number.isSafeInteger(uncollected) || ownCards.length > uncollected
-      || ownCards.some((card) => !(totalPrice(card) >= leaders.lastTotal))) {
+      || ownCards.some((card) => leaderIds.has(card.cardId) || !(totalPrice(card) >= leaders.lastTotal))) {
     throw transport.transportError("MM Cars Rental offers contradict the price-sorted results.", true);
+  }
+}
+
+// Full pagination keeps the first of MM Cars Rental's equally cheapest offers in the main list's
+// order. The supplier filter may order them differently; when their Pay Now amounts differ, that
+// choice changes the net rate, so the check retries with full pagination instead.
+function assertOwnCheapestIsUnambiguous(ownCards) {
+  const cheapest = Math.min(...ownCards.map(totalPrice));
+  const payNow = new Set(ownCards.filter((card) => totalPrice(card) === cheapest)
+    .map((card) => normalizeWhitespace(card.payNowText)));
+  if (payNow.size > 1) {
+    const error = new Error("MM Cars Rental's cheapest offers differ in Pay Now; retrying with full pagination.");
+    error.code = PRICE_LEADERS_AMBIGUOUS;
+    error.retryable = true;
+    throw error;
   }
 }
 
