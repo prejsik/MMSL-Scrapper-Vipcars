@@ -180,7 +180,8 @@ jobs:
   test:
     name: Run VipCars tests
     needs: prepare
-    runs-on: ubuntu-latest
+    # Playwright in the lockfile does not support Ubuntu 26.04.
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
 
     steps:
@@ -214,7 +215,8 @@ jobs:
     needs:
       - prepare
       - test
-    runs-on: ubuntu-latest
+    # Playwright in the lockfile does not support Ubuntu 26.04.
+    runs-on: ubuntu-24.04
     timeout-minutes: 180
     strategy:
       fail-fast: false
