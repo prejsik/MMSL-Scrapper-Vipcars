@@ -208,7 +208,8 @@ function createFingerprint(config) {
     timeout_ms: config.timeoutMs,
     attempt_budget_ms: config.attemptBudgetMs,
     job_budget_ms: config.jobBudgetMs,
-    network_results: config.networkResults
+    network_results: config.networkResults,
+    price_leaders: config.priceLeaders === true
   };
 }
 

@@ -7,6 +7,8 @@ const { validatePageSearch } = require("./searchContract");
 const transport = require("./resultTransport");
 const { createResultRequestGate } = require("./requestThrottle");
 const { readOfferCards, parseOfferPage } = require("./offerCards");
+const { PRICE_SORT, OWN_SUPPLIER_ID, OWN_FILTER_SOURCE, createPriceLeaderGate, isOwnProvider,
+  normalizeProvider } = require("./priceLeaders");
 const {
   ensureDir,
   formatMoney,
@@ -249,10 +251,22 @@ class VipCarsScraper {
         const filteredEmpty = automaticApplied && await bounded(this.waitForSearchOutcome(page, waitOptions)) === "no-results";
         const captured = await bounded((automaticApplied ? filteredResults : initialResults).read());
         if (!captured) throw transport.transportError("Initial result response was not captured.", true);
+        const networkOptions = { ...waitOptions, allowedResultUrls, resultFailures,
+          measure: (name, action, extra = {}) => diagnostics.measure(name,
+            () => bounded(Promise.resolve().then(action)), { aggregate: true, ...extra }) };
+        // Price leaders need the own-supplier filter to fetch MM Cars Rental's offers when they sit
+        // beyond the leaders; without that filter on the page, the search keeps full pagination.
+        const leaderGate = this.config.priceLeaders && automaticApplied && !filteredEmpty && !this.config.vehicleCategory
+          && await bounded(page.locator(`#supplier_checkbox_${OWN_SUPPLIER_ID}`).count()) > 0
+          ? createPriceLeaderGate({ durationDays: Number(this.config.currentDurationDays || 1) })
+          : null;
         raw = await diagnostics.measure("network_offers", () => bounded(this.loadNetworkOffers(
-          context, page, captured, location, { ...waitOptions, allowedResultUrls, resultFailures, filteredEmpty,
-            measure: (name, action, extra = {}) => diagnostics.measure(name,
-              () => bounded(Promise.resolve().then(action)), { aggregate: true, ...extra }) })));
+          context, page, captured, location, { ...networkOptions, filteredEmpty, leaderGate })));
+        if (leaderGate?.state.stopped && !leaderGate.state.ownSeen) {
+          const own = await diagnostics.measure("own_offers", () => bounded(this.loadOwnSupplierOffers(
+            context, page, location, networkOptions)));
+          raw = raw.concat(own);
+        }
       } else {
         await diagnostics.measure("load_cards", () => bounded(this.loadSearchResultCards(page, waitOptions)));
       }
@@ -360,11 +374,17 @@ class VipCarsScraper {
     const filtered = await measure("network_prep", async () => {
       transport.validateResultRequest(captured.source, this.buildSearchUrl(location));
       const filtered = captured.source.params.get("load_type") === "get_result_desktop_filter";
+      if (options.ownSupplier && !filtered) {
+        throw transport.transportError("Own-supplier result request is not filtered.");
+      }
       if (filtered) {
         const specs = captured.source.params.getAll("specs_checks");
-        const otherFilters = ["supplier_checks", "class_checks", "fuel_checks", "location_checks", "excess_checks",
+        const suppliers = captured.source.params.getAll("supplier_checks").filter(Boolean);
+        const expectedSuppliers = options.ownSupplier ? [options.ownSupplier] : [];
+        const otherFilters = ["class_checks", "fuel_checks", "location_checks", "excess_checks",
           "deposit_checks", "seat_checks", "mileage_checks", "fuel_policy_checks", "payment_type_checks"];
         if (specs.length !== 1 || specs[0] !== "automatic"
+            || JSON.stringify(suppliers) !== JSON.stringify(expectedSuppliers)
             || otherFilters.some((field) => captured.source.params.getAll(field).some(Boolean))) {
           throw transport.transportError("Automatic result request contains unexpected filters.");
         }
@@ -408,8 +428,11 @@ class VipCarsScraper {
       });
       const paginationSource = await measure("network_prep", () => initial.cards.length < initial.totalCount
         ? transport.preparePaginationSource(page, captured.source) : captured.source);
+      const leaders = options.leaderGate && filtered && captured.source.params.get("sort_by") === PRICE_SORT
+        ? options.leaderGate : null;
       const cards = await transport.collectResultPages({ initial, source: paginationSource,
         deadlineAt: options.deadlineAt, onState: options.onState,
+        stopWhen: leaders ? (collected) => leaders.shouldStop(collected) : undefined,
         fetchPage: async (url, timeout) => {
           try {
             options.allowedResultUrls.add(url);
@@ -430,10 +453,31 @@ class VipCarsScraper {
           }
         }
       });
-      console.log(`    Network results: ${cards.length}/${initial.totalCount}; first-page DOM values verified.`);
+      console.log(`    Network results: ${cards.length}/${initial.totalCount}`
+        + `${leaders?.state.stopped ? " (price leaders)" : ""}; first-page DOM values verified.`);
       return cards;
     } finally {
       await measure("network_prep", () => parserPage.close());
+    }
+  }
+
+  async loadOwnSupplierOffers(context, page, location, options) {
+    const capture = transport.captureInitialResults(page, { filtered: true });
+    try {
+      const applied = await readiness.applySupplierFilter(page, OWN_SUPPLIER_ID, { timeoutMs: this.config.timeoutMs, ...options });
+      if (!applied) throw transport.transportError("MM Cars Rental supplier filter is unavailable.", true);
+      const filteredEmpty = await this.waitForSearchOutcome(page, options) === "no-results";
+      const captured = await capture.read();
+      if (!captured) throw transport.transportError("MM Cars Rental filtered response was not captured.", true);
+      const cards = await this.loadNetworkOffers(context, page, captured, location,
+        { ...options, filteredEmpty, ownSupplier: OWN_SUPPLIER_ID });
+      if (cards.some((card) => !isOwnProvider(card.provider))) {
+        throw transport.transportError("MM Cars Rental supplier filter returned another supplier.");
+      }
+      console.log(`    MM Cars Rental offers: ${cards.length} (supplier filter).`);
+      return cards.map((card) => ({ ...card, offerSource: OWN_FILTER_SOURCE }));
+    } finally {
+      capture.detach();
     }
   }
 
@@ -472,7 +516,7 @@ class VipCarsScraper {
         pay_now_amount: payNow ? Number(payNow.value.toFixed(2)) : "",
         pay_now_currency: payNow ? normalizeCurrency(payNow.currency) : "",
         currency,
-        source: "search"
+        source: candidate.offerSource || "search"
       });
     }
 
@@ -537,14 +581,6 @@ function resolveVipCarsLocation(value) {
     throw new Error(`Unsupported VipCars location: ${value}. Add its VIPCars country/city/location IDs before scraping.`);
   }
   return location;
-}
-
-function normalizeProvider(value) {
-  return normalizeWhitespace(value)
-    .replace(/^EuropCar$/i, "Europcar")
-    .replace(/^Surprice Car Rental$/i, "SurPrice")
-    .replace(/^Green motion$/i, "Green Motion")
-    .replace(/^Ace$/i, "Ace Rent a Car");
 }
 
 function dedupeOffers(offers) {

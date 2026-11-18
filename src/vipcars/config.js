@@ -35,6 +35,10 @@ function parseCliArgs(argv) {
       args.networkResults = true;
       continue;
     }
+    if (key === "price-leaders") {
+      args.priceLeaders = true;
+      continue;
+    }
     const value = argv[index + 1];
     if (value == null || value.startsWith("--")) {
       throw new Error(`Missing value for argument: ${token}`);
@@ -334,6 +338,7 @@ function loadConfig(argv) {
     jobBudgetMs,
     resume: cli.resume === true,
     networkResults: cli.networkResults === true || fileConfig.networkResults === true,
+    priceLeaders: cli.priceLeaders === true || fileConfig.priceLeaders === true,
     resumeStatePath: `${outputCoverage}.resume.json`,
     locationConcurrency: Number.parseInt(merged.locationConcurrency || merged["location-concurrency"] || "1", 10),
     headless: merged.headless !== false,
@@ -382,6 +387,8 @@ Options:
   --job-budget-ms 10200000
   --resume
   --network-results  Experimental response pagination (not enabled by default)
+  --price-leaders    With --network-results: stop at the three cheapest competitors and fetch
+                     MM Cars Rental through its supplier filter
   --output-csv PATH
   --output-coverage PATH
   --headed

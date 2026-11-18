@@ -5,6 +5,7 @@ const DecimalJs = require("decimal.js");
 const { loadConfig } = require("./config");
 const { fetchEurPlnExchangeRate, DEFAULT_FALLBACK_PLN_PER_EUR } = require("./exchangeRate");
 const { parseCsv } = require("./reportHtml");
+const { OWN_FILTER_SOURCE } = require("./priceLeaders");
 
 const Decimal = DecimalJs.clone({ precision: 40 });
 
@@ -450,7 +451,9 @@ function payNowCalibration(mm, mmRate, settings) {
 }
 
 function addMmMetadata(decision, ranked, mmIndex, mmRate, calibration) {
-  decision.mm_rank = mmIndex + 1;
+  // An offer fetched through the own-supplier filter lies beyond the collected price leaders,
+  // so cheaper uncollected competitors may exist and its rank is unknown.
+  decision.mm_rank = ranked[mmIndex]?.source === OWN_FILTER_SOURCE ? null : mmIndex + 1;
   decision.mm_rate_eur_day = mmRate;
   if (calibration?.values) {
     Object.assign(decision, calibration.values);

@@ -80,8 +80,8 @@ async function main() {
   assert.match(workflow, /normalizeTransmission\(process\.argv\[1\]\)/);
   for (const value of ["automatic", "auto", " Automatic "]) assert.equal(normalizeTransmission(value), "automatic");
   for (const value of ["any", "all", "dowolna"]) assert.equal(normalizeTransmission(value), "any");
-  assert.match(workflow, /if \[\[ "\$TRANSMISSION" == "automatic" \]\]; then\s+command\+=\(--network-results\)\s+fi/,
-    "Automatic scheduled searches must use the live-validated response pagination path");
+  assert.match(workflow, /if \[\[ "\$TRANSMISSION" == "automatic" \]\]; then\s+command\+=\(--network-results --price-leaders\)\s+fi/,
+    "Automatic scheduled searches must use response pagination limited to the price leaders");
   assert.match(workflow, /needs\.prepare\.outputs\.vehicle_category == ''/);
   console.log("PASS one-off category runs do not replace the daily Pages report");
 

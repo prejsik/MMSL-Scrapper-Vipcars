@@ -475,7 +475,7 @@ async function fetchResultPage(page, url, timeout, observedHeaders = {}) {
   }, { url, timeout, headers });
 }
 
-async function collectResultPages({ initial, source, deadlineAt, fetchPage, onState }) {
+async function collectResultPages({ initial, source, deadlineAt, fetchPage, onState, stopWhen }) {
   const cards = [];
   const ids = new Set();
   const total = initial.totalCount;
@@ -503,6 +503,8 @@ async function collectResultPages({ initial, source, deadlineAt, fetchPage, onSt
     pageCount += 1;
     onState?.({ cardCount: cards.length, pageCount, totalCount: total, busy: cards.length < total });
     if (cards.length === total) return cards;
+    // A caller may end a verified sorted prefix early; every collected page keeps the checks above.
+    if (stopWhen?.(cards)) return cards;
     offset = batch.nextOffset;
     page = batch.nextPage;
     const remaining = deadlineAt - Date.now();
