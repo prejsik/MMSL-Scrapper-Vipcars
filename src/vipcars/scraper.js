@@ -8,7 +8,7 @@ const transport = require("./resultTransport");
 const { createResultRequestGate } = require("./requestThrottle");
 const { readOfferCards, parseOfferPage } = require("./offerCards");
 const { PRICE_SORT, OWN_SUPPLIER_ID, OWN_FILTER_SOURCE, createPriceLeaderGate, isOwnProvider,
-  normalizeProvider } = require("./priceLeaders");
+  normalizeProvider, totalPrice } = require("./priceLeaders");
 const {
   ensureDir,
   formatMoney,
@@ -257,14 +257,22 @@ class VipCarsScraper {
         // Price leaders need the own-supplier filter to fetch MM Cars Rental's offers when they sit
         // beyond the leaders; without that filter on the page, the search keeps full pagination.
         const leaderGate = this.config.priceLeaders && automaticApplied && !filteredEmpty && !this.config.vehicleCategory
-          && await bounded(page.locator(`#supplier_checkbox_${OWN_SUPPLIER_ID}`).count()) > 0
+          && await bounded(page.locator(`#supplier_checkbox_${OWN_SUPPLIER_ID}:not([disabled])`).count()) > 0
           ? createPriceLeaderGate({ durationDays: Number(this.config.currentDurationDays || 1) })
           : null;
+        // TIMING reports the pages of both searches: the own-supplier pass adds to the leaders' count.
+        let leaderPages = 0;
         raw = await diagnostics.measure("network_offers", () => bounded(this.loadNetworkOffers(
-          context, page, captured, location, { ...networkOptions, filteredEmpty, leaderGate })));
+          context, page, captured, location, { ...networkOptions, filteredEmpty, leaderGate,
+            onState: (state) => {
+              if (Number.isInteger(state?.pageCount)) leaderPages = state.pageCount;
+              diagnostics.recordResultState(state);
+            } })));
         if (leaderGate?.state.stopped && !leaderGate.state.ownSeen) {
           const own = await diagnostics.measure("own_offers", () => bounded(this.loadOwnSupplierOffers(
-            context, page, location, networkOptions)));
+            context, page, location, { ...networkOptions,
+              onState: (state) => diagnostics.recordResultState({ ...state, pageCount: (state?.pageCount ?? 0) + leaderPages }) })));
+          assertOwnOffersFollowLeaders(own, raw.length, leaderGate.state);
           raw = raw.concat(own);
         }
       } else {
@@ -411,6 +419,9 @@ class VipCarsScraper {
         if (filtered && batch.cards.some((card) => !card.automatic)) {
           throw transport.transportError("Non-automatic offer in an automatic result page.");
         }
+        if (options.ownSupplier && batch.cards.some((card) => !isOwnProvider(card.provider))) {
+          throw transport.transportError("MM Cars Rental supplier filter returned another supplier.");
+        }
         return batch;
       });
       const initial = await parsePage(captured.html);
@@ -428,8 +439,10 @@ class VipCarsScraper {
       });
       const paginationSource = await measure("network_prep", () => initial.cards.length < initial.totalCount
         ? transport.preparePaginationSource(page, captured.source) : captured.source);
-      const leaders = options.leaderGate && filtered && captured.source.params.get("sort_by") === PRICE_SORT
+      const leaders = options.leaderGate && filtered
+        && JSON.stringify(captured.source.params.getAll("sort_by")) === JSON.stringify([PRICE_SORT])
         ? options.leaderGate : null;
+      if (leaders) leaders.state.totalCount = initial.totalCount;
       const cards = await transport.collectResultPages({ initial, source: paginationSource,
         deadlineAt: options.deadlineAt, onState: options.onState,
         stopWhen: leaders ? (collected) => leaders.shouldStop(collected) : undefined,
@@ -462,22 +475,45 @@ class VipCarsScraper {
   }
 
   async loadOwnSupplierOffers(context, page, location, options) {
+    const deadlineAt = options.deadlineAt ?? Date.now() + (this.config.attemptBudgetMs || 180000);
+    // Listen before the click: a page without a busy indicator already shows automatic cards,
+    // so only the filtered response and the view it renders prove the filter took effect.
+    const before = (await page.evaluate(readOfferCards, { location })).map((card) => card.cardId).join("|");
     const capture = transport.captureInitialResults(page, { filtered: true });
     try {
       const applied = await readiness.applySupplierFilter(page, OWN_SUPPLIER_ID, { timeoutMs: this.config.timeoutMs, ...options });
       if (!applied) throw transport.transportError("MM Cars Rental supplier filter is unavailable.", true);
-      const filteredEmpty = await this.waitForSearchOutcome(page, options) === "no-results";
-      const captured = await capture.read();
-      if (!captured) throw transport.transportError("MM Cars Rental filtered response was not captured.", true);
+      let captured;
+      while (!(captured = await capture.read())) {
+        if (Date.now() >= deadlineAt) throw transport.transportError("MM Cars Rental filtered response was not captured.", true);
+        await page.waitForTimeout(200);
+      }
+      const filteredEmpty = await this.waitForOwnSupplierView(page, location, deadlineAt, before);
       const cards = await this.loadNetworkOffers(context, page, captured, location,
         { ...options, filteredEmpty, ownSupplier: OWN_SUPPLIER_ID });
-      if (cards.some((card) => !isOwnProvider(card.provider))) {
-        throw transport.transportError("MM Cars Rental supplier filter returned another supplier.");
-      }
       console.log(`    MM Cars Rental offers: ${cards.length} (supplier filter).`);
       return cards.map((card) => ({ ...card, offerSource: OWN_FILTER_SOURCE }));
     } finally {
       capture.detach();
+    }
+  }
+
+  // Waits until the filtered view replaces the pre-click cards; the supplier of every card is
+  // then checked against the network response, so a wrong supplier fails fast instead of waiting.
+  async waitForOwnSupplierView(page, location, deadlineAt, before) {
+    while (true) {
+      const view = await page.evaluate(() => {
+        const busy = String(document.getElementById("page_busy")?.value ?? "").trim().toLowerCase();
+        const empty = document.querySelector('.notFoundImg img[alt="No Results Found"]');
+        return { busy: ["1", "true", "busy", "loading"].includes(busy), noResults: Boolean(empty?.getClientRects().length) };
+      });
+      if (!view.busy) {
+        if (view.noResults) return true;
+        const visible = await page.evaluate(readOfferCards, { location });
+        if (visible.length && visible.map((card) => card.cardId).join("|") !== before) return false;
+      }
+      if (Date.now() >= deadlineAt) throw transport.transportError("MM Cars Rental results did not appear.", true);
+      await page.waitForTimeout(200);
     }
   }
 
@@ -595,6 +631,17 @@ function dedupeOffers(offers) {
     unique.push(offer);
   }
   return unique;
+}
+
+// MM Cars Rental was absent from the collected sorted prefix, so all of its offers must fit in the
+// uncollected remainder and cost at least as much as the last collected offer. Anything else means
+// the two responses describe different result sets, and the attempt must not be priced.
+function assertOwnOffersFollowLeaders(ownCards, collectedCount, leaders) {
+  const uncollected = Number(leaders.totalCount) - collectedCount;
+  if (!Number.isSafeInteger(uncollected) || ownCards.length > uncollected
+      || ownCards.some((card) => !(totalPrice(card) >= leaders.lastTotal))) {
+    throw transport.transportError("MM Cars Rental offers contradict the price-sorted results.", true);
+  }
 }
 
 function selectBestOffersByProvider(offers, maxProviders) {

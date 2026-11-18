@@ -7,6 +7,7 @@ const { createPriceLeaderGate } = require("../src/vipcars/priceLeaders");
 const { collectResultPages, parseResultRequest } = require("../src/vipcars/resultTransport");
 const { VipCarsScraper } = require("../src/vipcars/scraper");
 const { buildRecommendations } = require("../src/vipcars/pricingRecommendations");
+const { buildHtmlReport } = require("../src/vipcars/reportHtml");
 
 const offer = (id, provider, total) => ({ cardId: id, provider, priceText: `EUR ${total.toFixed(2)}` });
 const gate = () => createPriceLeaderGate({ durationDays: 2 });
@@ -31,6 +32,23 @@ function testOwnOffersAreNotCompetitorsAndAliasesAreOneProvider() {
   assert.equal(leaders.state.ownSeen, true);
   assert.deepEqual(leaders.state.competitors.map((item) => item.provider), ["ace rent a car", "b", "c"]);
   console.log("PASS own offers are not competitors and provider aliases count once");
+}
+
+function testOwnTieAtTheBoundaryKeepsPaginating() {
+  const leaders = gate();
+  const cards = [offer("1", "A", 10), offer("2", "B", 11), offer("3", "C", 12), offer("4", "MM Cars Rental", 13)];
+  assert.equal(leaders.shouldStop(cards), false, "a later offer at MM's daily rate could rank before it");
+  assert.equal(leaders.shouldStop([...cards, offer("5", "Delta", 13)]), false);
+  assert.equal(leaders.shouldStop([...cards, offer("5", "Delta", 13), offer("6", "E", 14)]), true);
+  console.log("PASS a tie with MM Cars Rental at the boundary keeps pagination going");
+}
+
+function testOrderUsesTheRentalTotalNotTheRoundedDailyRate() {
+  const leaders = createPriceLeaderGate({ durationDays: 14 });
+  assert.equal(leaders.shouldStop([offer("1", "A", 100), offer("2", "B", 120), offer("3", "C", 140.02),
+    offer("4", "D", 140.01), offer("5", "E", 200)]), false);
+  assert.equal(leaders.state.ordered, false, "140.01 after 140.02 is out of order although both round to 10.00/day");
+  console.log("PASS price order is checked on the rental total, not the rounded daily rate");
 }
 
 function testBrokenOrderOrUnreadablePriceDisablesEarlyStop() {
@@ -83,7 +101,7 @@ function pageHtml(cards, nextOffset, nextPage, total) {
     $("#car_count_data").val(${total});</script>`;
 }
 
-function bootstrap(urls, withOwnCheckbox) {
+function bootstrap(urls, ownCheckbox, ownTotal) {
   return `<!doctype html><style>.scv-car-box{display:block;width:240px;height:80px}</style>
     <input id="pickup_country" value="119"><input id="dropoff_country" value="119">
     <input id="pickup_city" value="1744"><input id="dropoff_city" value="1744">
@@ -93,7 +111,7 @@ function bootstrap(urls, withOwnCheckbox) {
     <input name="currency" value="EUR"><input id="page_busy" value="1">
     <input id="price_range" value="0,1000" data-slider-min="0" data-slider-max="1000">
     <input id="filter_automatic" type="checkbox">
-    ${withOwnCheckbox ? '<input id="supplier_checkbox_mm_cars_rental" type="checkbox" value="mm_cars_rental">' : ""}
+    ${ownCheckbox ? `<input id="supplier_checkbox_mm_cars_rental" type="checkbox" value="mm_cars_rental"${ownCheckbox === "disabled" ? " disabled" : ""}>` : ""}
     <span id="car_count_data">8</span><div id="results"></div>
     <script>
       window.SITE_URL = 'https://be.supplycars.com/be1';
@@ -112,18 +130,19 @@ function bootstrap(urls, withOwnCheckbox) {
         document.getElementById('page_busy').value = '0';
       };
       document.getElementById('filter_automatic').addEventListener('change', () => show(${JSON.stringify(urls.automatic)}, 8));
-      document.getElementById('supplier_checkbox_mm_cars_rental')?.addEventListener('change', () => show(${JSON.stringify(urls.own)}, 3));
+      document.getElementById('supplier_checkbox_mm_cars_rental')?.addEventListener('change', () => show(${JSON.stringify(urls.own)}, ${ownTotal}));
       show(${JSON.stringify(urls.initial)}, 8);
     </script>`;
 }
 
+const SORTED = [
+  [card("a1", "A", 20), card("a2", "A", 22)],
+  [card("b1", "B", 24), card("c1", "C", 26)],
+  [card("d1", "D", 28), card("c2", "C", 30)],
+  [card("m1", "MM Cars Rental", 60), card("m2", "MM Cars Rental", 65)]
+];
 const AUTOMATIC_PAGES = {
-  sorted: [
-    [card("a1", "A", 20), card("a2", "A", 22)],
-    [card("b1", "B", 24), card("c1", "C", 26)],
-    [card("d1", "D", 28), card("c2", "C", 30)],
-    [card("m1", "MM Cars Rental", 60), card("e1", "E", 70)]
-  ],
+  sorted: SORTED,
   unsorted: [
     [card("a1", "A", 20), card("a2", "A", 22)],
     [card("b1", "B", 18), card("c1", "C", 26)],
@@ -137,11 +156,18 @@ const AUTOMATIC_PAGES = {
     [card("e1", "E", 70), card("e2", "E", 80)]
   ]
 };
-const OWN_PAGES = [[card("m2", "MM Cars Rental", 50), card("m3", "MM Cars Rental", 55)], [card("m4", "MM Cars Rental", 90)]];
+// The own-supplier filter must describe the same result set as the sorted list above.
+const OWN_PAGES = {
+  sorted: [[card("m1", "MM Cars Rental", 60), card("m2", "MM Cars Rental", 65)]],
+  "contradicting-own": [[card("m1", "MM Cars Rental", 25), card("m2", "MM Cars Rental", 65)]],
+  "foreign-own": [[card("a1", "A", 20), card("m2", "MM Cars Rental", 65)]]
+};
+const FULL_PAGINATION = ["unsorted", "no-own-checkbox", "disabled-own-checkbox", "double-sort"];
 
 async function runCase(browser, scenario) {
-  const withOwnCheckbox = scenario !== "no-own-checkbox";
+  const ownCheckbox = scenario === "no-own-checkbox" ? null : scenario === "disabled-own-checkbox" ? "disabled" : "enabled";
   const automaticPages = AUTOMATIC_PAGES[scenario] || AUTOMATIC_PAGES.sorted;
+  const ownPages = OWN_PAGES[scenario] || OWN_PAGES.sorted;
   const artifactsDir = fs.mkdtempSync(path.join(os.tmpdir(), "vipcars-leaders-test-"));
   const config = { baseUrl: "https://www.vipcars.com", pickupDate: "2026-10-02", dropoffDate: "2026-10-04",
     pickupTime: "10:00", dropoffTime: "10:00", currentDurationDays: 2, driverAge: 30, currency: "EUR",
@@ -163,6 +189,7 @@ async function runCase(browser, scenario) {
   params.set("specs_checks", "automatic");
   params.set("price_range", "0,1000");
   params.set("sort_by", "2");
+  if (scenario === "double-sort") params.append("sort_by", "1");
   params.delete("offset"); params.delete("car_page");
   const automatic = `https://be.supplycars.com/be1/node.php?${params}`;
   params.set("supplier_checks", "mm_cars_rental");
@@ -178,7 +205,7 @@ async function runCase(browser, scenario) {
         continue: async () => {
           const url = route.request().url();
           if (url === searchUrl) return route.fulfill({ status: 200, contentType: "text/html",
-            body: bootstrap({ initial, automatic, own }, withOwnCheckbox) });
+            body: bootstrap({ initial, automatic, own }, ownCheckbox, ownPages.flat().length) });
           const source = parseResultRequest(url, { includeFiltered: true });
           if (!source) return route.abort("aborted");
           if (route.request().method() === "OPTIONS") {
@@ -193,7 +220,7 @@ async function runCase(browser, scenario) {
             const index = source.params.has("offset") ? Number(source.params.get("offset")) / 2 : 0;
             requests.push(`${ownRequest ? "own" : "automatic"}:${index}`);
             html = ownRequest
-              ? pageHtml(OWN_PAGES[index], (index + 1) * 2, index + 1, 3)
+              ? pageHtml(ownPages[index], (index + 1) * 2, index + 1, ownPages.flat().length)
               : pageHtml(automaticPages[index], (index + 1) * 2, index + 1, 8);
           }
           return route.fulfill({ status: 200, contentType: "text/html",
@@ -203,23 +230,35 @@ async function runCase(browser, scenario) {
     };
   } };
   try {
-    const result = await scraper.runSingleLocation(adapter, "Warsaw");
+    let timing;
+    const result = await scraper.runSingleLocation(adapter, "Warsaw", { onDiagnostics: (value) => { timing = value; } });
+    if (scenario === "contradicting-own" || scenario === "foreign-own") {
+      assert.equal(result.ok, false, "contradicting or foreign own-supplier offers must not be priced");
+      assert.equal(result.error.code, "RESULT_TRANSPORT_INVALID");
+      assert.match(result.error.message, scenario === "foreign-own" ? /another supplier/ : /contradict/);
+      assert.deepEqual(requests, ["automatic:0", "automatic:1", "automatic:2", "own:0"]);
+      console.log(`PASS price leaders workflow: ${scenario}`);
+      return;
+    }
     assert.equal(result.ok, true, result.error?.message);
     const byProvider = Object.fromEntries(result.results.map((row) => [row.provider, row]));
     if (scenario === "sorted") {
-      assert.deepEqual(requests, ["automatic:0", "automatic:1", "automatic:2", "own:0", "own:1"]);
+      assert.deepEqual(requests, ["automatic:0", "automatic:1", "automatic:2", "own:0"]);
       assert.deepEqual(Object.keys(byProvider).sort(), ["A", "B", "C", "D", "MM Cars Rental"]);
-      assert.equal(byProvider["MM Cars Rental"].total_price, 50);
+      assert.equal(byProvider["MM Cars Rental"].total_price, 60);
       assert.equal(byProvider["MM Cars Rental"].source, "search_own_filter");
       assert.equal(byProvider.A.source, "search");
+      assert.equal(timing.result_state.pageCount, 4, "TIMING counts the leaders' and the own-supplier pages");
     } else if (scenario === "own-in-leaders") {
       assert.deepEqual(requests, ["automatic:0", "automatic:1", "automatic:2"]);
       assert.equal(byProvider["MM Cars Rental"].total_price, 21);
       assert.equal(byProvider["MM Cars Rental"].source, "search");
     } else {
+      assert.ok(FULL_PAGINATION.includes(scenario));
       assert.deepEqual(requests, ["automatic:0", "automatic:1", "automatic:2", "automatic:3"],
-        "unsorted results or a missing own-supplier filter keep full pagination");
-      assert.deepEqual(Object.keys(byProvider).sort(), ["A", "B", "C", "D", "E", "MM Cars Rental"]);
+        "unsorted results, an ambiguous sort or an unusable own-supplier filter keep full pagination");
+      assert.deepEqual(Object.keys(byProvider).sort(),
+        scenario === "unsorted" ? ["A", "B", "C", "D", "E", "MM Cars Rental"] : ["A", "B", "C", "D", "MM Cars Rental"]);
       assert.equal(byProvider["MM Cars Rental"].source, "search");
     }
     console.log(`PASS price leaders workflow: ${scenario}`);
@@ -248,15 +287,36 @@ function testRecommendationLeavesOwnRankEmptyBeyondLeaders() {
   console.log("PASS own rank stays empty when MM Cars Rental is beyond the price leaders");
 }
 
+function testReportKeepsOwnPriceButNoRankBeyondLeaders() {
+  const row = (provider, perDay, source = "search") => ({ location: "Warsaw", duration_days: "2",
+    pickup_date: "2026-10-02", dropoff_date: "2026-10-04", provider, provider_rating: "",
+    price_per_day: String(perDay), currency: "EUR", source });
+  const coverage = [{ location: "Warsaw", duration_days: "2", pickup_date: "2026-10-02", dropoff_date: "2026-10-04",
+    status: "complete", result_count: "4", error: "" }];
+  const html = buildHtmlReport([row("A", 10), row("B", 12), row("C", 13),
+    row("MM Cars Rental", 30, "search_own_filter")], "2026-10-01T05:00:00.000Z", coverage);
+  const warsaw = html.slice(html.indexOf('<tr data-location="Warsaw"'));
+  const cells = warsaw.slice(0, warsaw.indexOf("</tr>"));
+  assert.match(cells, /Poza czołówką/);
+  assert.match(cells, /30\.00 EUR\/day/, "the exact MM Cars Rental price stays visible");
+  assert.doesNotMatch(cells, /Top 4/);
+  assert.equal([...cells.matchAll(/MM Cars Rental/g)].length, 0, "the own offer is not placed in a Top column");
+  console.log("PASS report keeps the own price but no rank beyond the price leaders");
+}
+
 async function main() {
   testGateStopsOnlyAfterThreeCompetitorsAndAStrictlyHigherPrice();
   testOwnOffersAreNotCompetitorsAndAliasesAreOneProvider();
+  testOwnTieAtTheBoundaryKeepsPaginating();
+  testOrderUsesTheRentalTotalNotTheRoundedDailyRate();
   testBrokenOrderOrUnreadablePriceDisablesEarlyStop();
   await testPaginationStopsWithoutFetchingLaterPages();
   testRecommendationLeavesOwnRankEmptyBeyondLeaders();
+  testReportKeepsOwnPriceButNoRankBeyondLeaders();
   const browser = await chromium.launch({ headless: true });
   try {
-    for (const scenario of ["sorted", "own-in-leaders", "unsorted", "no-own-checkbox"]) await runCase(browser, scenario);
+    for (const scenario of ["sorted", "own-in-leaders", "unsorted", "no-own-checkbox", "disabled-own-checkbox",
+      "double-sort", "contradicting-own", "foreign-own"]) await runCase(browser, scenario);
   } finally { await browser.close(); }
 }
 

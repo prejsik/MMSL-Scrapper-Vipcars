@@ -24,42 +24,48 @@ function isOwnProvider(value) {
   return normalizeWhitespace(value).toLowerCase().includes("mm cars rental");
 }
 
-function dailyPrice(card, durationDays) {
+function totalPrice(card) {
   const money = parseMoney(card?.priceText);
-  if (!money || !Number.isFinite(Number(money.value)) || !(durationDays > 0)) return NaN;
-  return Number((Number(money.value) / durationDays).toFixed(2));
+  const value = Number(money?.value);
+  return money && Number.isFinite(value) ? value : NaN;
 }
 
+// Recommendations rank by the rounded daily rate, so the stop compares rounded daily rates;
+// the order check uses the unrounded rental total, which rounding cannot hide.
 function createPriceLeaderGate({ durationDays, competitorCount = 3 }) {
-  const state = { ordered: true, ownSeen: false, competitors: [], cutoff: null, stopped: false };
+  const state = { ordered: true, ownSeen: false, ownDaily: null, competitors: [], cutoff: null,
+    stopped: false, lastTotal: -Infinity, lastDaily: -Infinity, totalCount: null };
   const seen = new Set();
   let checked = 0;
-  let lastPrice = -Infinity;
   return {
     state,
     shouldStop(cards) {
       for (; checked < cards.length; checked += 1) {
         const card = cards[checked];
-        const price = dailyPrice(card, durationDays);
+        const total = totalPrice(card);
         const provider = normalizeProvider(card?.provider).toLowerCase();
-        if (!Number.isFinite(price) || price < lastPrice || !provider) {
+        if (!Number.isFinite(total) || total < state.lastTotal || !provider || !(durationDays > 0)) {
           state.ordered = false;
           continue;
         }
-        lastPrice = price;
+        state.lastTotal = total;
+        state.lastDaily = Number((total / durationDays).toFixed(2));
         if (isOwnProvider(provider)) {
+          if (!state.ownSeen) state.ownDaily = state.lastDaily;
           state.ownSeen = true;
         } else if (!seen.has(provider)) {
           seen.add(provider);
-          if (state.competitors.length < competitorCount) state.competitors.push({ provider, price });
+          if (state.competitors.length < competitorCount) state.competitors.push({ provider, price: state.lastDaily });
         }
       }
       if (!state.ordered || state.competitors.length < competitorCount) return false;
       state.cutoff = state.competitors[competitorCount - 1].price;
-      state.stopped = lastPrice > state.cutoff;
+      // A later offer at MM Cars Rental's daily rate would tie it and could change its rank.
+      state.stopped = state.lastDaily > state.cutoff && (!state.ownSeen || state.lastDaily > state.ownDaily);
       return state.stopped;
     }
   };
 }
 
-module.exports = { PRICE_SORT, OWN_SUPPLIER_ID, OWN_FILTER_SOURCE, createPriceLeaderGate, isOwnProvider, normalizeProvider };
+module.exports = { PRICE_SORT, OWN_SUPPLIER_ID, OWN_FILTER_SOURCE, createPriceLeaderGate, isOwnProvider,
+  normalizeProvider, totalPrice };

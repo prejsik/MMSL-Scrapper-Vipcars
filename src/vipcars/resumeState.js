@@ -209,7 +209,8 @@ function createFingerprint(config) {
     attempt_budget_ms: config.attemptBudgetMs,
     job_budget_ms: config.jobBudgetMs,
     network_results: config.networkResults,
-    price_leaders: config.priceLeaders === true
+    // Present only when enabled, so checkpoints written before this option still resume.
+    ...(config.priceLeaders === true ? { price_leaders: true } : {})
   };
 }
 

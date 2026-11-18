@@ -1,6 +1,7 @@
 const fs = require("fs");
 const path = require("path");
 const { sanitizeMessage } = require("./diagnostics");
+const { OWN_FILTER_SOURCE } = require("./priceLeaders");
 
 function escapeHtml(value) {
   return String(value ?? "")
@@ -274,6 +275,11 @@ function mmOfferSummary(offers) {
   }
 
   const offer = offers[rankIndex];
+  if (offer.source === OWN_FILTER_SOURCE) {
+    // Fetched through the supplier filter beyond the collected leaders: the price is exact,
+    // but uncollected competitors may be cheaper, so the rank stays unknown.
+    return { offer, rankLabel: "Poza czołówką", cheaperOffers: "Brak danych", state: "normal", className: "mm" };
+  }
   const className = mmClassName(offer, offers);
   let state = "normal";
   if (className.includes("mm-top1-gap")) {
@@ -363,13 +369,15 @@ function buildScenarioTable(scenario, index, total) {
         <td class="coverage-state-cell" colspan="11">${buildCoverageStatus(presentation)}</td>
       </tr>`;
     }
+    // Top columns show only the verified sorted prefix, never an offer from the supplier filter.
+    const leaders = group.offers.filter((offer) => offer.source !== OWN_FILTER_SOURCE);
     return `${rowStart}
         <td class="index">${rowIndex}</td>
         <td>${escapeHtml(group.location)}${buildCoverageStatus(presentation)}</td>
-        ${buildOfferCells(group.offers, 0)}
-        ${buildOfferCells(group.offers, 1)}
-        ${buildOfferCells(group.offers, 2)}
-        ${buildOfferCells(group.offers, 3)}
+        ${buildOfferCells(leaders, 0)}
+        ${buildOfferCells(leaders, 1)}
+        ${buildOfferCells(leaders, 2)}
+        ${buildOfferCells(leaders, 3)}
         ${buildMmSummaryCells(mmSummary)}
       </tr>`;
   }).join("\n");

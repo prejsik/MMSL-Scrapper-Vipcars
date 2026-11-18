@@ -187,8 +187,7 @@ async function main() {
       timeout_ms: 45000,
       attempt_budget_ms: 90000,
       job_budget_ms: 170 * 60 * 1000,
-      network_results: false,
-      price_leaders: false
+      network_results: false
     });
     assert.equal(partialState.results.length, 1);
     assert.equal(partialState.coverage.find((row) => row.location === "Warsaw").status, "complete");
