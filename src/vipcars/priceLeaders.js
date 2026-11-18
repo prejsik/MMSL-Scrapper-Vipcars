@@ -31,8 +31,9 @@ function totalPrice(card) {
 }
 
 // Recommendations rank by the rounded daily rate, so the stop compares rounded daily rates;
-// the order check uses the unrounded rental total, which rounding cannot hide.
-function createPriceLeaderGate({ durationDays, competitorCount = 3 }) {
+// the order check uses the unrounded rental total, which rounding cannot hide. Pricing uses the
+// three cheapest competitors; the HTML report shows four, so four are resolved, ties included.
+function createPriceLeaderGate({ durationDays, competitorCount = 4 }) {
   const state = { ordered: true, ownSeen: false, ownDaily: null, competitors: [], cutoff: null,
     stopped: false, lastTotal: -Infinity, lastDaily: -Infinity, totalCount: null };
   const seen = new Set();

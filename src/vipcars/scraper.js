@@ -80,6 +80,8 @@ class VipCarsScraper {
     const passAttempts = options.attemptsPerPass ?? maxAttempts;
     const deadlineAt = options.deadlineAt ?? Infinity;
     const cooldown = options.cooldown || this.cooldown;
+    // The CLI creates a scraper per attempt, so it passes a durable set shared by all attempts.
+    const fullPaginationKeys = options.fullPaginationKeys || this.fullPaginationKeys;
     let outcome;
     for (let pass = 0; pass < passAttempts; pass += 1) {
       const attempts = counts.get(key) || 0;
@@ -108,9 +110,12 @@ class VipCarsScraper {
       counts.set(key, attempts + 1);
       outcome = await this.runSingleLocation(browser, location, {
         attempt: attempts + 1, deadlineAt, cooldown, onCooldown: options.onCooldown, cooldownWaitMs,
-        onDiagnostics: options.onDiagnostics, fullPagination: this.fullPaginationKeys.has(key)
+        onDiagnostics: options.onDiagnostics, fullPagination: fullPaginationKeys.has(key)
       });
-      if (outcome.error?.code === PRICE_LEADERS_AMBIGUOUS) this.fullPaginationKeys.add(key);
+      if (outcome.error?.code === PRICE_LEADERS_AMBIGUOUS && !fullPaginationKeys.has(key)) {
+        fullPaginationKeys.add(key);
+        options.onFullPagination?.();
+      }
       outcome.attempts = attempts + 1;
       outcome.retryable = !outcome.ok && outcome.attempts < maxAttempts
         && Date.now() < deadlineAt && (outcome.error?.retryable === true || isTimeoutError(outcome.error));
@@ -264,6 +269,7 @@ class VipCarsScraper {
         const leaderGate = this.config.priceLeaders && !options.fullPagination && automaticApplied && !filteredEmpty
           && !this.config.vehicleCategory
           && await bounded(ownFilter.count()) === 1 && await bounded(ownFilter.isEnabled())
+          && !await bounded(ownFilter.isChecked())
           ? createPriceLeaderGate({ durationDays: Number(this.config.currentDurationDays || 1) })
           : null;
         // TIMING reports the pages of both searches: the own-supplier pass adds to the leaders' count.
@@ -399,7 +405,11 @@ class VipCarsScraper {
         const baseUrl = base ? new URL(base.url) : null;
         const ownUrl = new URL(captured.source.url);
         const fields = new Set([...(base?.params.keys() || []), ...captured.source.params.keys()]);
-        if (!base || baseUrl.origin !== ownUrl.origin || baseUrl.pathname !== ownUrl.pathname
+        const firstPage = ["offset", "car_page"].every((field) => {
+          const values = captured.source.params.getAll(field);
+          return values.length === 0 || (values.length === 1 && values[0] === "0");
+        });
+        if (!base || !firstPage || baseUrl.origin !== ownUrl.origin || baseUrl.pathname !== ownUrl.pathname
             || [...fields].some((field) => !ignored.has(field)
               && JSON.stringify(base.params.getAll(field)) !== JSON.stringify(captured.source.params.getAll(field)))) {
           throw transport.transportError("MM Cars Rental request changes the search or its filters.");
@@ -508,7 +518,8 @@ class VipCarsScraper {
     const deadlineAt = options.deadlineAt ?? Date.now() + (this.config.attemptBudgetMs || 180000);
     // Listen before the click: a page without a busy indicator already shows automatic cards,
     // so only the filtered response, and a view that matches it, prove the filter took effect.
-    const capture = transport.captureInitialResults(page, { filtered: true });
+    const capture = transport.captureInitialResults(page, { filtered: true,
+      accept: (source) => source.params.getAll("supplier_checks").includes(OWN_SUPPLIER_ID) });
     try {
       const applied = await readiness.applySupplierFilter(page, OWN_SUPPLIER_ID, { timeoutMs: this.config.timeoutMs, ...options });
       if (!applied) throw transport.transportError("MM Cars Rental supplier filter is unavailable.", true);
@@ -517,7 +528,8 @@ class VipCarsScraper {
         if (Date.now() >= deadlineAt) throw transport.transportError("MM Cars Rental filtered response was not captured.", true);
         await page.waitForTimeout(200);
       }
-      const responseEmpty = !/class=["'][^"']*\bscv-car-box\b/.test(captured.html);
+      // The same card reader that parses offers decides whether the response has any.
+      const responseEmpty = (await page.evaluate(readOfferCards, { html: captured.html, location })).length === 0;
       if (responseEmpty) await this.confirmEmptyView(page, location, deadlineAt);
       const cards = await this.loadNetworkOffers(context, page, captured, location,
         { ...options, filteredEmpty: responseEmpty, awaitParity: true, ownSupplier: OWN_SUPPLIER_ID });
@@ -534,7 +546,7 @@ class VipCarsScraper {
     while (true) {
       const state = await readiness.readResultState(page);
       const cards = await page.evaluate(readOfferCards, { location });
-      if (!state.busy && state.noResults && state.cardCount === 0 && cards.length === 0) return;
+      if (!state.busy && state.noResults && state.cardCount === 0 && cards.length === 0 && !(state.totalCount > 0)) return;
       if (Date.now() >= deadlineAt) {
         throw transport.transportError("MM Cars Rental empty result does not match the page.", true);
       }
@@ -675,8 +687,10 @@ function assertOwnOffersFollowLeaders(ownCards, leaderCards, leaders) {
 // choice changes the net rate, so the check retries with full pagination instead.
 function assertOwnCheapestIsUnambiguous(ownCards) {
   const cheapest = Math.min(...ownCards.map(totalPrice));
-  const payNow = new Set(ownCards.filter((card) => totalPrice(card) === cheapest)
-    .map((card) => normalizeWhitespace(card.payNowText)));
+  const payNow = new Set(ownCards.filter((card) => totalPrice(card) === cheapest).map((card) => {
+    const money = parseMoney(card.payNowText);
+    return money ? `${Number(money.value.toFixed(2))}|${normalizeCurrency(money.currency)}` : "missing";
+  }));
   if (payNow.size > 1) {
     const error = new Error("MM Cars Rental's cheapest offers differ in Pay Now; retrying with full pagination.");
     error.code = PRICE_LEADERS_AMBIGUOUS;

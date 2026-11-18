@@ -87,7 +87,7 @@ async function main(argv = process.argv.slice(2)) {
               appendUniqueResults(allResults, resultKeys, results);
               applyScenarioChecks(coverageRows, pickupDate, durationDays, checks);
               saveCheckpoint(config, allResults, coverageRows, runState);
-            }, runOptions(browser, attemptCounts, deadlineAt, runState.cooldown, persistRunState));
+            }, runOptions(browser, attemptCounts, deadlineAt, runState.cooldown, persistRunState, runState.fullPagination));
             checkpointOutcome({
               config,
               allResults,
@@ -132,7 +132,7 @@ async function main(argv = process.argv.slice(2)) {
               appendUniqueResults(allResults, resultKeys, recoveryResults);
               applyScenarioChecks(coverageRows, pickupDate, durationDays, recoveryChecks);
               saveCheckpoint(config, allResults, coverageRows, runState);
-            }, runOptions(browser, attemptCounts, deadlineAt, runState.cooldown, persistRunState));
+            }, runOptions(browser, attemptCounts, deadlineAt, runState.cooldown, persistRunState, runState.fullPagination));
             checkpointOutcome({
               config,
               allResults,
@@ -175,12 +175,15 @@ async function main(argv = process.argv.slice(2)) {
   }
 }
 
-function runOptions(browser, attemptCounts, deadlineAt, cooldown, onCooldown) {
+function runOptions(browser, attemptCounts, deadlineAt, cooldown, onCooldown, fullPaginationKeys) {
   return {
     browser,
     attemptCounts,
     cooldown,
     onCooldown,
+    // Checks whose price leaders were ambiguous stay on full pagination for later attempts.
+    fullPaginationKeys,
+    onFullPagination: onCooldown,
     maxAttemptsPerCheck: MAX_ATTEMPTS_PER_CHECK,
     attemptsPerPass: 1,
     deadlineAt

@@ -402,12 +402,13 @@ async function preparePaginationSource(page, source) {
   return next;
 }
 
-function captureInitialResults(page, { filtered = false } = {}) {
+function captureInitialResults(page, { filtered = false, accept } = {}) {
   let captured;
   const listener = (response) => {
     const source = parseResultRequest(response.url(), { includeFiltered: filtered });
     const loadType = filtered ? "get_result_desktop_filter" : "get_result_desktop";
-    if (captured || !source || source.params.get("load_type") !== loadType || !isInitialPage(source)) return;
+    if (captured || !source || source.params.get("load_type") !== loadType || !isInitialPage(source)
+        || (accept && !accept(source))) return;
     const request = response.request();
     if (request.method() === "OPTIONS") return;
     if (request.method() !== "GET" || request.postData()) {
