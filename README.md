@@ -20,9 +20,9 @@ The recommendations command derives the required coverage matrix from `vipcars.c
 The workflow `.github/workflows/vipcars-daily.yml` publishes:
 
 ```text
-https://prejsik.github.io/VipCars-tool/report.html
-https://prejsik.github.io/VipCars-tool/vipcars-recommendations.xlsx
-https://prejsik.github.io/VipCars-tool/vipcars-rates-import-ready.xlsx
+https://prejsik.github.io/MMSL-Scrapper-Vipcars/report.html
+https://prejsik.github.io/MMSL-Scrapper-Vipcars/vipcars-recommendations.xlsx
+https://prejsik.github.io/MMSL-Scrapper-Vipcars/vipcars-rates-import-ready.xlsx
 ```
 
 The HTML includes every planned date/duration/location from coverage, even when no offers were collected. Incomplete checks and verified empty searches are distinguished; an unsuccessful check is not reported as confirmed absence of MM Cars. A partial report cannot reconstruct prices that were never fetched. The import XLSX is published only when baseline validation, workbook generation and at least one complete pricing band have been verified. A baseline-only workbook remains in the run artifacts for diagnosis, not on Pages or as an import link in Telegram.
