@@ -59,8 +59,11 @@ function createPriceLeaderGate({ durationDays, competitorCount = 4 }) {
           if (state.competitors.length < competitorCount) state.competitors.push({ provider, price: state.lastDaily });
         }
       }
-      if (!state.ordered || state.competitors.length < competitorCount) return false;
-      state.cutoff = state.competitors[competitorCount - 1].price;
+      // With MM Cars Rental among the leaders, the report's Top 4 is MM plus three competitors, or four
+      // competitors cheaper than MM, which passing MM's own daily rate already resolves.
+      const needed = state.ownSeen ? competitorCount - 1 : competitorCount;
+      if (!state.ordered || state.competitors.length < needed) return false;
+      state.cutoff = state.competitors[needed - 1].price;
       // A later offer at MM Cars Rental's daily rate would tie it and could change its rank.
       state.stopped = state.lastDaily > state.cutoff && (!state.ownSeen || state.lastDaily > state.ownDaily);
       return state.stopped;

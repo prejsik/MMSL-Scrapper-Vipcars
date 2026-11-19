@@ -112,7 +112,7 @@ class VipCarsScraper {
         attempt: attempts + 1, deadlineAt, cooldown, onCooldown: options.onCooldown, cooldownWaitMs,
         onDiagnostics: options.onDiagnostics, fullPagination: fullPaginationKeys.has(key)
       });
-      if (outcome.error?.code === PRICE_LEADERS_AMBIGUOUS && !fullPaginationKeys.has(key)) {
+      if (outcome.error?.priceLeadersFallback && !fullPaginationKeys.has(key)) {
         fullPaginationKeys.add(key);
         options.onFullPagination?.();
       }
@@ -281,12 +281,20 @@ class VipCarsScraper {
               diagnostics.recordResultState(state);
             } })));
         if (leaderGate?.state.stopped && !leaderGate.state.ownSeen) {
-          const own = await diagnostics.measure("own_offers", () => bounded(this.loadOwnSupplierOffers(
-            context, page, location, { ...networkOptions, baseSource: captured.source,
-              onState: (state) => diagnostics.recordResultState({ ...state, pageCount: (state?.pageCount ?? 0) + leaderPages }) })));
-          assertOwnOffersFollowLeaders(own, raw, leaderGate.state);
-          assertOwnCheapestIsUnambiguous(own);
-          raw = raw.concat(own);
+          try {
+            const own = await diagnostics.measure("own_offers", () => bounded(this.loadOwnSupplierOffers(
+              context, page, location, { ...networkOptions, baseSource: captured.source,
+                onState: (state) => diagnostics.recordResultState({ ...state, pageCount: (state?.pageCount ?? 0) + leaderPages }) })));
+            assertOwnOffersFollowLeaders(own, raw, leaderGate.state);
+            assertOwnCheapestIsUnambiguous(own);
+            raw = raw.concat(own);
+          } catch (error) {
+            // Nothing from a failed own-supplier step is priced; the next attempt reads the full list,
+            // which does not depend on the supplier filter.
+            error.priceLeadersFallback = true;
+            error.retryable = true;
+            throw error;
+          }
         }
       } else {
         await diagnostics.measure("load_cards", () => bounded(this.loadSearchResultCards(page, waitOptions)));
@@ -301,9 +309,12 @@ class VipCarsScraper {
       return { ok: true, cheapest: selected[0], results: selected };
     } catch (error) {
       if (expired || Date.now() >= deadlineAt) {
+        const fallback = error?.priceLeadersFallback === true;
         error = new Error(`Search attempt timeout exceeded (${attemptBudgetMs}ms maximum).`);
         error.name = "TimeoutError";
         error.code = "ATTEMPT_TIMEOUT";
+        // A deadline spent in the own-supplier step still moves the next attempt to full pagination.
+        if (fallback) error.priceLeadersFallback = true;
       }
       error.message = sanitizeMessage(error.message);
       attemptError = error;
@@ -405,11 +416,7 @@ class VipCarsScraper {
         const baseUrl = base ? new URL(base.url) : null;
         const ownUrl = new URL(captured.source.url);
         const fields = new Set([...(base?.params.keys() || []), ...captured.source.params.keys()]);
-        const firstPage = ["offset", "car_page"].every((field) => {
-          const values = captured.source.params.getAll(field);
-          return values.length === 0 || (values.length === 1 && values[0] === "0");
-        });
-        if (!base || !firstPage || baseUrl.origin !== ownUrl.origin || baseUrl.pathname !== ownUrl.pathname
+        if (!base || !isUnambiguousFirstPage(captured.source) || baseUrl.origin !== ownUrl.origin || baseUrl.pathname !== ownUrl.pathname
             || [...fields].some((field) => !ignored.has(field)
               && JSON.stringify(base.params.getAll(field)) !== JSON.stringify(captured.source.params.getAll(field)))) {
           throw transport.transportError("MM Cars Rental request changes the search or its filters.");
@@ -417,7 +424,10 @@ class VipCarsScraper {
       }
       if (filtered) {
         const specs = captured.source.params.getAll("specs_checks");
-        const suppliers = captured.source.params.getAll("supplier_checks").filter(Boolean);
+        // The own-supplier request must name exactly that supplier once; a search without a
+        // supplier may still carry the site's empty supplier_checks parameter.
+        const rawSuppliers = captured.source.params.getAll("supplier_checks");
+        const suppliers = options.ownSupplier ? rawSuppliers : rawSuppliers.filter(Boolean);
         const expectedSuppliers = options.ownSupplier ? [options.ownSupplier] : [];
         const otherFilters = ["class_checks", "fuel_checks", "location_checks", "excess_checks",
           "deposit_checks", "seat_checks", "mileage_checks", "fuel_policy_checks", "payment_type_checks"];
@@ -481,6 +491,7 @@ class VipCarsScraper {
         ? transport.preparePaginationSource(page, captured.source) : captured.source);
       const leaders = options.leaderGate && filtered
         && JSON.stringify(captured.source.params.getAll("sort_by")) === JSON.stringify([PRICE_SORT])
+        && isUnambiguousFirstPage(captured.source)
         ? options.leaderGate : null;
       if (leaders) leaders.state.totalCount = initial.totalCount;
       const cards = await transport.collectResultPages({ initial, source: paginationSource,
@@ -546,7 +557,13 @@ class VipCarsScraper {
     while (true) {
       const state = await readiness.readResultState(page);
       const cards = await page.evaluate(readOfferCards, { location });
-      if (!state.busy && state.noResults && state.cardCount === 0 && cards.length === 0 && !(state.totalCount > 0)) return;
+      // Every offer counter the page exposes must read zero; one positive counter contradicts the empty view.
+      const counters = await page.evaluate(() => ["car_count_data", "car_count"].flatMap((id) => {
+        const element = document.getElementById(id);
+        return element ? [element.value, element.textContent].map((value) => String(value ?? "").trim()).filter(Boolean) : [];
+      }));
+      const countersZero = counters.every((value) => /^0+$/.test(value));
+      if (!state.busy && state.noResults && state.cardCount === 0 && cards.length === 0 && countersZero) return;
       if (Date.now() >= deadlineAt) {
         throw transport.transportError("MM Cars Rental empty result does not match the page.", true);
       }
@@ -670,6 +687,13 @@ function dedupeOffers(offers) {
   return unique;
 }
 
+function isUnambiguousFirstPage(source) {
+  return ["offset", "car_page"].every((field) => {
+    const values = source.params.getAll(field);
+    return values.length === 0 || (values.length === 1 && values[0] === "0");
+  });
+}
+
 // MM Cars Rental was absent from the collected sorted prefix, so all of its offers must fit in the
 // uncollected remainder and cost at least as much as the last collected offer. Anything else means
 // the two responses describe different result sets, and the attempt must not be priced.
@@ -694,7 +718,6 @@ function assertOwnCheapestIsUnambiguous(ownCards) {
   if (payNow.size > 1) {
     const error = new Error("MM Cars Rental's cheapest offers differ in Pay Now; retrying with full pagination.");
     error.code = PRICE_LEADERS_AMBIGUOUS;
-    error.retryable = true;
     throw error;
   }
 }

@@ -35,6 +35,15 @@ function testOwnOffersAreNotCompetitorsAndAliasesAreOneProvider() {
   console.log("PASS own offers are not competitors and provider aliases count once");
 }
 
+function testOwnAmongLeadersNeedsOnlyThreeCompetitors() {
+  const leaders = gate();
+  const cards = [offer("1", "MM Cars Rental", 10), offer("2", "A", 11), offer("3", "B", 12), offer("4", "C", 13)];
+  assert.equal(leaders.shouldStop(cards), false, "the third competitor's rate could still be tied");
+  assert.equal(leaders.shouldStop([...cards, offer("5", "A", 20)]), true,
+    "with MM among the leaders the report's Top 4 is already complete");
+  console.log("PASS three competitors suffice when MM Cars Rental is among the leaders");
+}
+
 function testOwnTieAtTheBoundaryKeepsPaginating() {
   const leaders = gate();
   const cards = [offer("1", "A", 10), offer("2", "B", 11), offer("3", "C", 12), offer("4", "MM Cars Rental", 13)];
@@ -103,7 +112,8 @@ function pageHtml(cards, nextOffset, nextPage, total) {
     $("#car_count_data").val(${total});</script>`;
 }
 
-function bootstrap(urls, ownCheckbox, ownTotal, { lateOwn = false, ownSliderMin = 0, ownShownTotal = ownTotal } = {}) {
+function bootstrap(urls, ownCheckbox, ownTotal, { lateOwn = false, ownSliderMin = 0, ownShownTotal = ownTotal,
+  ownCarCount = ownShownTotal } = {}) {
   return `<!doctype html><style>.scv-car-box{display:block;width:240px;height:80px}</style>
     <input id="pickup_country" value="119"><input id="dropoff_country" value="119">
     <input id="pickup_city" value="1744"><input id="dropoff_city" value="1744">
@@ -116,7 +126,7 @@ function bootstrap(urls, ownCheckbox, ownTotal, { lateOwn = false, ownSliderMin 
     ${ownCheckbox === "fieldset-disabled" ? "<fieldset disabled>" : ""}
     ${ownCheckbox ? `<input id="supplier_checkbox_mm_cars_rental" type="checkbox" value="mm_cars_rental"${ownCheckbox === "disabled" ? " disabled" : ""}${ownCheckbox === "checked" ? " checked" : ""}>` : ""}
     ${ownCheckbox === "fieldset-disabled" ? "</fieldset>" : ""}
-    <span id="car_count_data">8</span><div id="results"></div>
+    <span id="car_count_data">8</span><input type="hidden" id="car_count" value="8"><div id="results"></div>
     <script>
       window.SITE_URL = 'https://be.supplycars.com/be1';
       window.affiliate_cookie_data = 'fixture-affiliate';
@@ -128,12 +138,13 @@ function bootstrap(urls, ownCheckbox, ownTotal, { lateOwn = false, ownSliderMin 
         params.delete('load_type');
         return params.toString();
       };
-      const show = async (url, total, late = false) => {
+      const show = async (url, total, late = false, carCount = total) => {
         document.getElementById('page_busy').value = '1';
         const response = await fetch(url);
         const html = await response.text();
         const results = document.getElementById('results');
         document.getElementById('car_count_data').textContent = total;
+        document.getElementById('car_count').value = carCount;
         document.getElementById('page_busy').value = '0';
         if (!late) { results.innerHTML = html; return; }
         const parsed = new DOMParser().parseFromString(html, 'text/html');
@@ -145,7 +156,7 @@ function bootstrap(urls, ownCheckbox, ownTotal, { lateOwn = false, ownSliderMin 
       document.getElementById('supplier_checkbox_mm_cars_rental')?.addEventListener('change', (event) => {
         ownActive = event.target.checked;
         document.getElementById('price_range').setAttribute('data-slider-min', '${ownSliderMin}');
-        show(${JSON.stringify(urls.own)}, ${ownShownTotal}, ${lateOwn});
+        show(${JSON.stringify(urls.own)}, ${ownShownTotal}, ${lateOwn}, ${ownCarCount});
       });
       show(${JSON.stringify(urls.initial)}, 8);
     </script>`;
@@ -184,14 +195,18 @@ const OWN_PAGES = {
   "own-tie-paynow": [[card("m2", "MM Cars Rental", 60, 12), card("m1", "MM Cars Rental", 60, 6)]],
   "own-empty": [[]],
   "own-empty-positive-count": [[]],
+  "conflicting-counters-own": [[]],
   "own-wrong-range": [[card("m2", "MM Cars Rental", 65)]],
   "own-paynow-format": [[card("m1", "MM Cars Rental", 60, "6.00"), card("m2", "MM Cars Rental", 60, "6,00")]]
 };
 const FULL_PAGINATION = ["unsorted", "no-own-checkbox", "disabled-own-checkbox", "fieldset-disabled-own",
   "checked-own", "double-sort"];
-const REJECTED = { "contradicting-own": /contradict/, "foreign-own": /another supplier/,
+// A failed own-supplier step prices nothing and moves the next attempt to full pagination.
+const FALLBACK = { "contradicting-own": /contradict/, "foreign-own": /another supplier/,
   "duplicate-id-own": /contradict/, "own-wrong-range": /changes the search/,
-  "own-duplicate-cursor": /changes the search/ };
+  "own-duplicate-cursor": /changes the search/, "own-extra-supplier": /unexpected filters/,
+  "own-tie-paynow": /Pay Now/, "own-empty-positive-count": /timeout/, "conflicting-counters-own": /timeout/ };
+const SLOW_FALLBACK = ["own-empty-positive-count", "conflicting-counters-own"];
 
 async function runCase(browser, scenario) {
   const checkboxStates = { "no-own-checkbox": null, "disabled-own-checkbox": "disabled",
@@ -205,7 +220,7 @@ async function runCase(browser, scenario) {
     pickupTime: "10:00", dropoffTime: "10:00", currentDurationDays: 2, driverAge: 30, currency: "EUR",
     transmission: "automatic", networkResults: true, priceLeaders: true, maxProvidersPerLocation: 25,
     // Up to seven result requests at the production three-second pacing.
-    timeoutMs: 2000, attemptBudgetMs: scenario === "own-empty-positive-count" ? 25000 : 40000, artifactsDir };
+    timeoutMs: 2000, attemptBudgetMs: SLOW_FALLBACK.includes(scenario) ? 25000 : 40000, artifactsDir };
   const scraper = new VipCarsScraper(config);
   const searchUrl = scraper.buildSearchUrl("Warsaw");
   const params = new URL(searchUrl).searchParams;
@@ -223,8 +238,13 @@ async function runCase(browser, scenario) {
   params.set("sort_by", "2");
   if (scenario === "double-sort") params.append("sort_by", "1");
   params.delete("offset"); params.delete("car_page");
+  if (scenario === "leaders-duplicate-cursor") {
+    params.set("offset", "0"); params.set("car_page", "0"); params.append("car_page", "5");
+  }
   const automatic = `https://be.supplycars.com/be1/node.php?${params}`;
+  params.delete("offset"); params.delete("car_page");
   params.set("supplier_checks", "mm_cars_rental");
+  if (scenario === "own-extra-supplier") params.append("supplier_checks", "");
   if (scenario === "own-wrong-range") params.set("price_range", "63,1000");
   if (scenario === "own-duplicate-cursor") {
     params.append("offset", "0"); params.append("offset", "10");
@@ -244,7 +264,9 @@ async function runCase(browser, scenario) {
           if (url === searchUrl) return route.fulfill({ status: 200, contentType: "text/html",
             body: bootstrap({ initial, automatic, own }, ownCheckbox, ownPages.flat().length,
               { lateOwn: scenario === "own-late-render", ownSliderMin: scenario === "own-wrong-range" ? 63 : 0,
-                ownShownTotal: scenario === "own-empty-positive-count" ? 2 : ownPages.flat().length }) });
+                ownShownTotal: scenario === "own-empty-positive-count" ? 2 : ownPages.flat().length,
+                ownCarCount: scenario === "own-empty-positive-count" || scenario === "conflicting-counters-own" ? 2
+                  : ownPages.flat().length }) });
           const source = parseResultRequest(url, { includeFiltered: true });
           if (!source) return route.abort("aborted");
           if (route.request().method() === "OPTIONS") {
@@ -255,7 +277,7 @@ async function runCase(browser, scenario) {
           if (source.params.get("load_type") === "get_result_desktop") {
             html = pageHtml([card("u1", "A", 20), card("u2", "A", 22)], 2, 1, 8);
           } else {
-            const ownRequest = source.params.get("supplier_checks") === "mm_cars_rental";
+            const ownRequest = source.params.getAll("supplier_checks").includes("mm_cars_rental");
             const index = source.params.has("offset") ? Number(source.params.get("offset")) / 2 : 0;
             requests.push(`${ownRequest ? "own" : "automatic"}:${index}`);
             html = ownRequest
@@ -275,41 +297,40 @@ async function runCase(browser, scenario) {
   } };
   try {
     let timing;
-    if (scenario === "own-tie-paynow") {
-      // Equal cheapest MM offers with different Pay Now: the next attempt uses full pagination, which
-      // keeps the main list's first offer exactly as before price leaders existed. Like the CLI, each
-      // attempt uses a new scraper and only the shared, persisted state carries the decision.
+    if (FALLBACK[scenario]) {
+      // Like the CLI, each attempt uses a new scraper; only the shared, persisted state carries the
+      // switch to full pagination, which prices from the main list exactly as before price leaders.
+      let persisted = 0;
       const shared = { maxAttemptsPerCheck: 3, attemptsPerPass: 1, attemptCounts: new Map(),
         fullPaginationKeys: new Set(), onFullPagination: () => { persisted += 1; } };
-      let persisted = 0;
       const first = await scraper.runLocationWithRetries(adapter, "Warsaw", shared);
-      assert.equal(first.ok, false);
-      assert.equal(first.error.code, "PRICE_LEADERS_AMBIGUOUS");
+      assert.equal(first.ok, false, "a failed own-supplier step must not be priced");
+      assert.match(first.error.message, FALLBACK[scenario]);
+      assert.equal(first.error.priceLeadersFallback, true);
       assert.equal(first.retryable, true);
       assert.equal(shared.fullPaginationKeys.size, 1);
       assert.equal(persisted, 1, "the fallback is persisted before the next attempt");
+      assert.deepEqual(requests, ["automatic:0", "automatic:1", "automatic:2", "own:0"]);
+      requests.length = 0;
       const result = await new VipCarsScraper(config).runLocationWithRetries(adapter, "Warsaw", shared);
       assert.equal(result.ok, true, result.error?.message);
-      assert.deepEqual(requests, ["automatic:0", "automatic:1", "automatic:2", "own:0",
-        "automatic:0", "automatic:1", "automatic:2", "automatic:3"]);
+      assert.deepEqual(requests, ["automatic:0", "automatic:1", "automatic:2", "automatic:3"]);
       const mm = result.results.find((row) => row.provider === "MM Cars Rental");
-      assert.equal(mm.pay_now_amount, 6);
-      assert.equal(mm.source, "search");
+      if (scenario === "own-empty-positive-count") {
+        assert.equal(mm, undefined);
+      } else {
+        assert.equal(mm.total_price, 60);
+        assert.equal(mm.pay_now_amount, 6);
+        assert.equal(mm.source, "search");
+      }
       console.log(`PASS price leaders workflow: ${scenario}`);
       return;
     }
     const result = await scraper.runSingleLocation(adapter, "Warsaw", { onDiagnostics: (value) => { timing = value; } });
-    if (REJECTED[scenario]) {
-      assert.equal(result.ok, false, "inconsistent own-supplier offers must not be priced");
-      assert.equal(result.error.code, "RESULT_TRANSPORT_INVALID");
-      assert.match(result.error.message, REJECTED[scenario]);
-      assert.deepEqual(requests, ["automatic:0", "automatic:1", "automatic:2", "own:0"]);
-      console.log(`PASS price leaders workflow: ${scenario}`);
-      return;
-    }
-    if (scenario === "own-empty-positive-count") {
-      assert.equal(result.ok, false, "an empty filter view with a positive offer counter is not proof of absence");
-      assert.deepEqual(requests, ["automatic:0", "automatic:1", "automatic:2", "own:0"]);
+    if (scenario === "leaders-duplicate-cursor") {
+      assert.equal(result.ok, false, "an ambiguous first-page cursor is neither shortened nor paginated");
+      assert.match(result.error.message, /Ambiguous result request cursor/);
+      assert.deepEqual(requests, ["automatic:0"]);
       console.log(`PASS price leaders workflow: ${scenario}`);
       return;
     }
@@ -392,6 +413,7 @@ async function main() {
   testGateStopsOnlyAfterThreeCompetitorsAndAStrictlyHigherPrice();
   testOwnOffersAreNotCompetitorsAndAliasesAreOneProvider();
   testOwnTieAtTheBoundaryKeepsPaginating();
+  testOwnAmongLeadersNeedsOnlyThreeCompetitors();
   testOrderUsesTheRentalTotalNotTheRoundedDailyRate();
   testBrokenOrderOrUnreadablePriceDisablesEarlyStop();
   await testPaginationStopsWithoutFetchingLaterPages();
@@ -400,9 +422,8 @@ async function main() {
   const browser = await chromium.launch({ headless: true });
   try {
     for (const scenario of ["sorted", "own-in-leaders", "own-late-render", "own-spaced-class", "own-empty",
-      "own-empty-positive-count", "own-paynow-format", "unsorted", "no-own-checkbox", "disabled-own-checkbox",
-      "fieldset-disabled-own", "checked-own", "double-sort", "contradicting-own", "foreign-own", "duplicate-id-own",
-      "own-wrong-range", "own-duplicate-cursor", "own-tie-paynow"]) await runCase(browser, scenario);
+      "own-paynow-format", "unsorted", "no-own-checkbox", "disabled-own-checkbox", "fieldset-disabled-own",
+      "checked-own", "double-sort", "leaders-duplicate-cursor", ...Object.keys(FALLBACK)]) await runCase(browser, scenario);
   } finally { await browser.close(); }
 }
 
