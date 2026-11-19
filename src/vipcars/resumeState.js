@@ -22,6 +22,7 @@ function createRunState(config, now = Date.now()) {
     coverageRows: createCoveragePlan(config),
     attemptCounts: new Map(),
     retryability: new Map(),
+    fullPagination: new Set(),
     cooldown: { until: 0 }
   };
 }
@@ -92,6 +93,7 @@ function loadRunState(targetPath, config, now = Date.now()) {
     throw new Error("Resume checkpoint cooldown_until is invalid.");
   }
   const retryability = validateRetryability(stored.retryability, coverageRows, cooldownUntil);
+  const fullPagination = validateFullPagination(stored.full_pagination, coverageRows);
 
   return {
     runId: stored.run_id,
@@ -104,6 +106,7 @@ function loadRunState(targetPath, config, now = Date.now()) {
     coverageRows,
     attemptCounts,
     retryability,
+    fullPagination,
     cooldown: { until: cooldownUntil }
   };
 }
@@ -123,6 +126,8 @@ function saveRunState(targetPath, state) {
     coverage: state.coverageRows,
     attempt_counts: attemptCounts,
     retryability: Object.fromEntries(state.retryability),
+    // Written only when used, so checkpoints without price-leader fallbacks keep their format.
+    ...(state.fullPagination?.size ? { full_pagination: [...state.fullPagination].sort() } : {}),
     cooldown_until: state.cooldown?.until || 0
   };
   fs.mkdirSync(path.dirname(targetPath), { recursive: true });
@@ -208,7 +213,9 @@ function createFingerprint(config) {
     timeout_ms: config.timeoutMs,
     attempt_budget_ms: config.attemptBudgetMs,
     job_budget_ms: config.jobBudgetMs,
-    network_results: config.networkResults
+    network_results: config.networkResults,
+    // Present only when enabled, so checkpoints written before this option still resume.
+    ...(config.priceLeaders === true ? { price_leaders: true } : {})
   };
 }
 
@@ -313,6 +320,15 @@ function validateRetryability(value, coverageRows, cooldownUntil) {
     }
   }
   return new Map(Object.entries(value));
+}
+
+function validateFullPagination(value, coverageRows) {
+  if (value === undefined) return new Set();
+  const coverage = new Set(coverageRows.map(coverageKey));
+  if (!Array.isArray(value) || value.some((key) => typeof key !== "string" || !coverage.has(key))) {
+    throw new Error("Resume checkpoint full_pagination is invalid.");
+  }
+  return new Set(value);
 }
 
 function coverageKey(row) {

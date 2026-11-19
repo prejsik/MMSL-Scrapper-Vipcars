@@ -402,12 +402,13 @@ async function preparePaginationSource(page, source) {
   return next;
 }
 
-function captureInitialResults(page, { filtered = false } = {}) {
+function captureInitialResults(page, { filtered = false, accept } = {}) {
   let captured;
   const listener = (response) => {
     const source = parseResultRequest(response.url(), { includeFiltered: filtered });
     const loadType = filtered ? "get_result_desktop_filter" : "get_result_desktop";
-    if (captured || !source || source.params.get("load_type") !== loadType || !isInitialPage(source)) return;
+    if (captured || !source || source.params.get("load_type") !== loadType || !isInitialPage(source)
+        || (accept && !accept(source))) return;
     const request = response.request();
     if (request.method() === "OPTIONS") return;
     if (request.method() !== "GET" || request.postData()) {
@@ -475,7 +476,7 @@ async function fetchResultPage(page, url, timeout, observedHeaders = {}) {
   }, { url, timeout, headers });
 }
 
-async function collectResultPages({ initial, source, deadlineAt, fetchPage, onState }) {
+async function collectResultPages({ initial, source, deadlineAt, fetchPage, onState, stopWhen }) {
   const cards = [];
   const ids = new Set();
   const total = initial.totalCount;
@@ -503,6 +504,8 @@ async function collectResultPages({ initial, source, deadlineAt, fetchPage, onSt
     pageCount += 1;
     onState?.({ cardCount: cards.length, pageCount, totalCount: total, busy: cards.length < total });
     if (cards.length === total) return cards;
+    // A caller may end a verified sorted prefix early; every collected page keeps the checks above.
+    if (stopWhen?.(cards)) return cards;
     offset = batch.nextOffset;
     page = batch.nextPage;
     const remaining = deadlineAt - Date.now();

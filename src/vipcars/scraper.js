@@ -7,6 +7,8 @@ const { validatePageSearch } = require("./searchContract");
 const transport = require("./resultTransport");
 const { createResultRequestGate } = require("./requestThrottle");
 const { readOfferCards, parseOfferPage } = require("./offerCards");
+const { PRICE_SORT, OWN_SUPPLIER_ID, OWN_FILTER_SOURCE, createPriceLeaderGate, isOwnProvider,
+  normalizeProvider, totalPrice } = require("./priceLeaders");
 const {
   ensureDir,
   formatMoney,
@@ -18,6 +20,7 @@ const {
 } = require("./utils");
 
 const MAX_TIMEOUT_RETRIES = 2;
+const PRICE_LEADERS_AMBIGUOUS = "PRICE_LEADERS_AMBIGUOUS";
 
 class VipCarsScraper {
   constructor(config) {
@@ -28,6 +31,8 @@ class VipCarsScraper {
     this.config = config;
     this.attemptCounts = new Map();
     this.cooldown = { until: 0 };
+    // Checks whose price leaders were ambiguous retry with full pagination.
+    this.fullPaginationKeys = new Set();
   }
 
   async run(onProgress, options = {}) {
@@ -75,6 +80,8 @@ class VipCarsScraper {
     const passAttempts = options.attemptsPerPass ?? maxAttempts;
     const deadlineAt = options.deadlineAt ?? Infinity;
     const cooldown = options.cooldown || this.cooldown;
+    // The CLI creates a scraper per attempt, so it passes a durable set shared by all attempts.
+    const fullPaginationKeys = options.fullPaginationKeys || this.fullPaginationKeys;
     let outcome;
     for (let pass = 0; pass < passAttempts; pass += 1) {
       const attempts = counts.get(key) || 0;
@@ -103,8 +110,12 @@ class VipCarsScraper {
       counts.set(key, attempts + 1);
       outcome = await this.runSingleLocation(browser, location, {
         attempt: attempts + 1, deadlineAt, cooldown, onCooldown: options.onCooldown, cooldownWaitMs,
-        onDiagnostics: options.onDiagnostics
+        onDiagnostics: options.onDiagnostics, fullPagination: fullPaginationKeys.has(key)
       });
+      if (outcome.error?.priceLeadersFallback && !fullPaginationKeys.has(key)) {
+        fullPaginationKeys.add(key);
+        options.onFullPagination?.();
+      }
       outcome.attempts = attempts + 1;
       outcome.retryable = !outcome.ok && outcome.attempts < maxAttempts
         && Date.now() < deadlineAt && (outcome.error?.retryable === true || isTimeoutError(outcome.error));
@@ -249,10 +260,42 @@ class VipCarsScraper {
         const filteredEmpty = automaticApplied && await bounded(this.waitForSearchOutcome(page, waitOptions)) === "no-results";
         const captured = await bounded((automaticApplied ? filteredResults : initialResults).read());
         if (!captured) throw transport.transportError("Initial result response was not captured.", true);
+        const networkOptions = { ...waitOptions, allowedResultUrls, resultFailures,
+          measure: (name, action, extra = {}) => diagnostics.measure(name,
+            () => bounded(Promise.resolve().then(action)), { aggregate: true, ...extra }) };
+        // Price leaders need the own-supplier filter to fetch MM Cars Rental's offers when they sit
+        // beyond the leaders; without that filter on the page, the search keeps full pagination.
+        const ownFilter = page.locator(`#supplier_checkbox_${OWN_SUPPLIER_ID}`);
+        const leaderGate = this.config.priceLeaders && !options.fullPagination && automaticApplied && !filteredEmpty
+          && !this.config.vehicleCategory
+          && await bounded(ownFilter.count()) === 1 && await bounded(ownFilter.isEnabled())
+          && !await bounded(ownFilter.isChecked())
+          ? createPriceLeaderGate({ durationDays: Number(this.config.currentDurationDays || 1) })
+          : null;
+        // TIMING reports the pages of both searches: the own-supplier pass adds to the leaders' count.
+        let leaderPages = 0;
         raw = await diagnostics.measure("network_offers", () => bounded(this.loadNetworkOffers(
-          context, page, captured, location, { ...waitOptions, allowedResultUrls, resultFailures, filteredEmpty,
-            measure: (name, action, extra = {}) => diagnostics.measure(name,
-              () => bounded(Promise.resolve().then(action)), { aggregate: true, ...extra }) })));
+          context, page, captured, location, { ...networkOptions, filteredEmpty, leaderGate,
+            onState: (state) => {
+              if (Number.isInteger(state?.pageCount)) leaderPages = state.pageCount;
+              diagnostics.recordResultState(state);
+            } })));
+        if (leaderGate?.state.stopped && !leaderGate.state.ownSeen) {
+          try {
+            const own = await diagnostics.measure("own_offers", () => bounded(this.loadOwnSupplierOffers(
+              context, page, location, { ...networkOptions, baseSource: captured.source,
+                onState: (state) => diagnostics.recordResultState({ ...state, pageCount: (state?.pageCount ?? 0) + leaderPages }) })));
+            assertOwnOffersFollowLeaders(own, raw, leaderGate.state);
+            assertOwnCheapestIsUnambiguous(own);
+            raw = raw.concat(own);
+          } catch (error) {
+            // Nothing from a failed own-supplier step is priced; the next attempt reads the full list,
+            // which does not depend on the supplier filter.
+            error.priceLeadersFallback = true;
+            error.retryable = true;
+            throw error;
+          }
+        }
       } else {
         await diagnostics.measure("load_cards", () => bounded(this.loadSearchResultCards(page, waitOptions)));
       }
@@ -266,9 +309,12 @@ class VipCarsScraper {
       return { ok: true, cheapest: selected[0], results: selected };
     } catch (error) {
       if (expired || Date.now() >= deadlineAt) {
+        const fallback = error?.priceLeadersFallback === true;
         error = new Error(`Search attempt timeout exceeded (${attemptBudgetMs}ms maximum).`);
         error.name = "TimeoutError";
         error.code = "ATTEMPT_TIMEOUT";
+        // A deadline spent in the own-supplier step still moves the next attempt to full pagination.
+        if (fallback) error.priceLeadersFallback = true;
       }
       error.message = sanitizeMessage(error.message);
       attemptError = error;
@@ -360,11 +406,33 @@ class VipCarsScraper {
     const filtered = await measure("network_prep", async () => {
       transport.validateResultRequest(captured.source, this.buildSearchUrl(location));
       const filtered = captured.source.params.get("load_type") === "get_result_desktop_filter";
+      if (options.ownSupplier && !filtered) {
+        throw transport.transportError("Own-supplier result request is not filtered.");
+      }
+      if (options.ownSupplier) {
+        // The supplier filter may differ from the leaders' search only by the supplier and the cursor.
+        const base = options.baseSource;
+        const ignored = new Set(["supplier_checks", "offset", "car_page", "_"]);
+        const baseUrl = base ? new URL(base.url) : null;
+        const ownUrl = new URL(captured.source.url);
+        const fields = new Set([...(base?.params.keys() || []), ...captured.source.params.keys()]);
+        if (!base || !isUnambiguousFirstPage(captured.source) || baseUrl.origin !== ownUrl.origin || baseUrl.pathname !== ownUrl.pathname
+            || [...fields].some((field) => !ignored.has(field)
+              && JSON.stringify(base.params.getAll(field)) !== JSON.stringify(captured.source.params.getAll(field)))) {
+          throw transport.transportError("MM Cars Rental request changes the search or its filters.");
+        }
+      }
       if (filtered) {
         const specs = captured.source.params.getAll("specs_checks");
-        const otherFilters = ["supplier_checks", "class_checks", "fuel_checks", "location_checks", "excess_checks",
+        // The own-supplier request must name exactly that supplier once; a search without a
+        // supplier may still carry the site's empty supplier_checks parameter.
+        const rawSuppliers = captured.source.params.getAll("supplier_checks");
+        const suppliers = options.ownSupplier ? rawSuppliers : rawSuppliers.filter(Boolean);
+        const expectedSuppliers = options.ownSupplier ? [options.ownSupplier] : [];
+        const otherFilters = ["class_checks", "fuel_checks", "location_checks", "excess_checks",
           "deposit_checks", "seat_checks", "mileage_checks", "fuel_policy_checks", "payment_type_checks"];
         if (specs.length !== 1 || specs[0] !== "automatic"
+            || JSON.stringify(suppliers) !== JSON.stringify(expectedSuppliers)
             || otherFilters.some((field) => captured.source.params.getAll(field).some(Boolean))) {
           throw transport.transportError("Automatic result request contains unexpected filters.");
         }
@@ -391,25 +459,44 @@ class VipCarsScraper {
         if (filtered && batch.cards.some((card) => !card.automatic)) {
           throw transport.transportError("Non-automatic offer in an automatic result page.");
         }
+        if (options.ownSupplier && batch.cards.some((card) => !isOwnProvider(card.provider))) {
+          throw transport.transportError("MM Cars Rental supplier filter returned another supplier.");
+        }
         return batch;
       });
       const initial = await parsePage(captured.html);
       await measure("network_dom_parity", async () => {
-        const visible = await page.evaluate(readOfferCards, { location });
-        transport.compareVisibleCards(initial.cards, visible);
-        const visibleCounts = await page.evaluate(() => ["car_count_data", "car_count"]
-          .map((id) => {
-            const element = document.getElementById(id);
-            return String(element?.value ?? element?.textContent ?? "").trim();
-          }).filter(Boolean));
-        if (!visibleCounts.length || visibleCounts.some((value) => !/^\d+$/.test(value) || Number(value) !== initial.totalCount)) {
-          throw transport.transportError("Result response and visible DOM total counts differ.");
+        // A filter clicked after the page settled may still be rendering its first page; such a
+        // caller waits, within the attempt deadline, until the view matches the captured response.
+        while (true) {
+          try {
+            const visible = await page.evaluate(readOfferCards, { location });
+            transport.compareVisibleCards(initial.cards, visible);
+            const visibleCounts = await page.evaluate(() => ["car_count_data", "car_count"]
+              .map((id) => {
+                const element = document.getElementById(id);
+                return String(element?.value ?? element?.textContent ?? "").trim();
+              }).filter(Boolean));
+            if (!visibleCounts.length || visibleCounts.some((value) => !/^\d+$/.test(value) || Number(value) !== initial.totalCount)) {
+              throw transport.transportError("Result response and visible DOM total counts differ.");
+            }
+            return;
+          } catch (error) {
+            if (!options.awaitParity || error.code !== "RESULT_TRANSPORT_INVALID" || Date.now() >= options.deadlineAt) throw error;
+            await page.waitForTimeout(200);
+          }
         }
       });
       const paginationSource = await measure("network_prep", () => initial.cards.length < initial.totalCount
         ? transport.preparePaginationSource(page, captured.source) : captured.source);
+      const leaders = options.leaderGate && filtered
+        && JSON.stringify(captured.source.params.getAll("sort_by")) === JSON.stringify([PRICE_SORT])
+        && isUnambiguousFirstPage(captured.source)
+        ? options.leaderGate : null;
+      if (leaders) leaders.state.totalCount = initial.totalCount;
       const cards = await transport.collectResultPages({ initial, source: paginationSource,
         deadlineAt: options.deadlineAt, onState: options.onState,
+        stopWhen: leaders ? (collected) => leaders.shouldStop(collected) : undefined,
         fetchPage: async (url, timeout) => {
           try {
             options.allowedResultUrls.add(url);
@@ -430,10 +517,57 @@ class VipCarsScraper {
           }
         }
       });
-      console.log(`    Network results: ${cards.length}/${initial.totalCount}; first-page DOM values verified.`);
+      console.log(`    Network results: ${cards.length}/${initial.totalCount}`
+        + `${leaders?.state.stopped ? " (price leaders)" : ""}; first-page DOM values verified.`);
       return cards;
     } finally {
       await measure("network_prep", () => parserPage.close());
+    }
+  }
+
+  async loadOwnSupplierOffers(context, page, location, options) {
+    const deadlineAt = options.deadlineAt ?? Date.now() + (this.config.attemptBudgetMs || 180000);
+    // Listen before the click: a page without a busy indicator already shows automatic cards,
+    // so only the filtered response, and a view that matches it, prove the filter took effect.
+    const capture = transport.captureInitialResults(page, { filtered: true,
+      accept: (source) => source.params.getAll("supplier_checks").includes(OWN_SUPPLIER_ID) });
+    try {
+      const applied = await readiness.applySupplierFilter(page, OWN_SUPPLIER_ID, { timeoutMs: this.config.timeoutMs, ...options });
+      if (!applied) throw transport.transportError("MM Cars Rental supplier filter is unavailable.", true);
+      let captured;
+      while (!(captured = await capture.read())) {
+        if (Date.now() >= deadlineAt) throw transport.transportError("MM Cars Rental filtered response was not captured.", true);
+        await page.waitForTimeout(200);
+      }
+      // The same card reader that parses offers decides whether the response has any.
+      const responseEmpty = (await page.evaluate(readOfferCards, { html: captured.html, location })).length === 0;
+      if (responseEmpty) await this.confirmEmptyView(page, location, deadlineAt);
+      const cards = await this.loadNetworkOffers(context, page, captured, location,
+        { ...options, filteredEmpty: responseEmpty, awaitParity: true, ownSupplier: OWN_SUPPLIER_ID });
+      console.log(`    MM Cars Rental offers: ${cards.length} (supplier filter).`);
+      return cards.map((card) => ({ ...card, offerSource: OWN_FILTER_SOURCE }));
+    } finally {
+      capture.detach();
+    }
+  }
+
+  // An empty filtered response proves MM Cars Rental's absence only when the page agrees: no
+  // offer cards in the DOM and a visible no-results state once loading has finished.
+  async confirmEmptyView(page, location, deadlineAt) {
+    while (true) {
+      const state = await readiness.readResultState(page);
+      const cards = await page.evaluate(readOfferCards, { location });
+      // Every offer counter the page exposes must read zero; one positive counter contradicts the empty view.
+      const counters = await page.evaluate(() => ["car_count_data", "car_count"].flatMap((id) => {
+        const element = document.getElementById(id);
+        return element ? [element.value, element.textContent].map((value) => String(value ?? "").trim()).filter(Boolean) : [];
+      }));
+      const countersZero = counters.every((value) => /^0+$/.test(value));
+      if (!state.busy && state.noResults && state.cardCount === 0 && cards.length === 0 && countersZero) return;
+      if (Date.now() >= deadlineAt) {
+        throw transport.transportError("MM Cars Rental empty result does not match the page.", true);
+      }
+      await page.waitForTimeout(200);
     }
   }
 
@@ -472,7 +606,7 @@ class VipCarsScraper {
         pay_now_amount: payNow ? Number(payNow.value.toFixed(2)) : "",
         pay_now_currency: payNow ? normalizeCurrency(payNow.currency) : "",
         currency,
-        source: "search"
+        source: candidate.offerSource || "search"
       });
     }
 
@@ -539,14 +673,6 @@ function resolveVipCarsLocation(value) {
   return location;
 }
 
-function normalizeProvider(value) {
-  return normalizeWhitespace(value)
-    .replace(/^EuropCar$/i, "Europcar")
-    .replace(/^Surprice Car Rental$/i, "SurPrice")
-    .replace(/^Green motion$/i, "Green Motion")
-    .replace(/^Ace$/i, "Ace Rent a Car");
-}
-
 function dedupeOffers(offers) {
   const seen = new Set();
   const unique = [];
@@ -559,6 +685,41 @@ function dedupeOffers(offers) {
     unique.push(offer);
   }
   return unique;
+}
+
+function isUnambiguousFirstPage(source) {
+  return ["offset", "car_page"].every((field) => {
+    const values = source.params.getAll(field);
+    return values.length === 0 || (values.length === 1 && values[0] === "0");
+  });
+}
+
+// MM Cars Rental was absent from the collected sorted prefix, so all of its offers must fit in the
+// uncollected remainder and cost at least as much as the last collected offer. Anything else means
+// the two responses describe different result sets, and the attempt must not be priced.
+function assertOwnOffersFollowLeaders(ownCards, leaderCards, leaders) {
+  const uncollected = Number(leaders.totalCount) - leaderCards.length;
+  const leaderIds = new Set(leaderCards.map((card) => card.cardId));
+  if (!Number.isSafeInteger(uncollected) || ownCards.length > uncollected
+      || ownCards.some((card) => leaderIds.has(card.cardId) || !(totalPrice(card) >= leaders.lastTotal))) {
+    throw transport.transportError("MM Cars Rental offers contradict the price-sorted results.", true);
+  }
+}
+
+// Full pagination keeps the first of MM Cars Rental's equally cheapest offers in the main list's
+// order. The supplier filter may order them differently; when their Pay Now amounts differ, that
+// choice changes the net rate, so the check retries with full pagination instead.
+function assertOwnCheapestIsUnambiguous(ownCards) {
+  const cheapest = Math.min(...ownCards.map(totalPrice));
+  const payNow = new Set(ownCards.filter((card) => totalPrice(card) === cheapest).map((card) => {
+    const money = parseMoney(card.payNowText);
+    return money ? `${Number(money.value.toFixed(2))}|${normalizeCurrency(money.currency)}` : "missing";
+  }));
+  if (payNow.size > 1) {
+    const error = new Error("MM Cars Rental's cheapest offers differ in Pay Now; retrying with full pagination.");
+    error.code = PRICE_LEADERS_AMBIGUOUS;
+    throw error;
+  }
 }
 
 function selectBestOffersByProvider(offers, maxProviders) {

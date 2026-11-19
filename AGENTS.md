@@ -14,7 +14,8 @@ Ten plik czytają oba narzędzia; `CLAUDE.md` tylko go importuje. Repozytorium j
 - Lokalnie: `npm test`; przy zmianach w `tools/` także `npm run test:excel`; pełny zestaw: `npm run test:all`.
 - PR nie ma testów na GitHubie, więc o scaleniu decydują testy lokalne; podaj ich wynik w opisie PR.
 - Przebiegi z przeglądarką działają na `ubuntu-24.04`: Playwright 1.59.1 nie obsługuje Ubuntu 26.04, na które przeszło `ubuntu-latest` (od 13.11.2026 padała instalacja Chromium).
-- Stan 18.11.2026: ostatni w pełni udany „VipCars daily run” był 15.09.2026; od 26.09.2026 pobieranie cen pada w większości części przebiegu, a sposób pobierania zmieniano kilka razy (26.09–8.10). W obecnej wersji (limit 240 s na wyszukiwanie od 3.10) próby przekraczają limit przy pobieraniu kolejnych stron wyników (`network_http_fetch`), zgodnie z pomiarem opóźnień serwera z 8.10 w `README.md`.
+- Stan 18.11.2026: ostatni w pełni udany „VipCars daily run” był 15.09.2026; od 26.09.2026 pobieranie cen pada w większości części przebiegu, a sposób pobierania zmieniano kilka razy (26.09–8.10). W wersji z limitem 240 s na wyszukiwanie (od 3.10) próby przekraczały limit przy pobieraniu kolejnych stron wyników (`network_http_fetch`), zgodnie z pomiarem opóźnień serwera z 8.10 w `README.md`.
+- Przebieg dzienny pobiera tylko czołówkę cenową i oferty MM przez filtr dostawcy (`--price-leaders`, opis w `README.md`). Rekomendacja potrzebuje tylko najtańszej oferty MM i 3 najtańszych konkurentów. Pozycja MM spoza czołówki zostaje pusta; zmiana tej zasady to zmiana logiki cen.
 
 ## Publiczne repo
 

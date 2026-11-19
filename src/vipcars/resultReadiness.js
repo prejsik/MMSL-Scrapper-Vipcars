@@ -71,20 +71,31 @@ async function loadSearchResultCards(page, options = {}) {
 }
 
 async function applyAutomaticTransmissionFilter(page, options = {}) {
+  return applyFilterCheckbox(page, "#filter_automatic", options);
+}
+
+async function applySupplierFilter(page, supplierId, options = {}) {
+  if (!/^[a-z0-9_]+$/.test(String(supplierId || ""))) {
+    throw new Error("Supplier filter id must contain only lowercase letters, digits and underscores.");
+  }
+  return applyFilterCheckbox(page, `#supplier_checkbox_${supplierId}`, options);
+}
+
+async function applyFilterCheckbox(page, filterSelector, options = {}) {
   const deadlineAt = getDeadline(options);
-  const filter = page.locator("#filter_automatic");
+  const filter = page.locator(filterSelector);
   if (!(await filter.count().catch(() => 0))) {
     return false;
   }
 
   const initiallyChecked = await filter.isChecked().catch(() => false);
-  let initialState = await readResultState(page);
+  let initialState = await readResultState(page, filterSelector);
   emitState(options, initialState);
 
   while (!initiallyChecked && initialState.busy) {
     ensureFilterBudget(deadlineAt, initialState);
     await waitForNextPoll(page, deadlineAt, options.pollIntervalMs);
-    initialState = await readResultState(page);
+    initialState = await readResultState(page, filterSelector);
     emitState(options, initialState);
   }
 
@@ -110,7 +121,7 @@ async function applyAutomaticTransmissionFilter(page, options = {}) {
   let lastState = null;
 
   while (true) {
-    lastState = await readResultState(page);
+    lastState = await readResultState(page, filterSelector);
     emitState(options, lastState);
     if (lastState.hasBusyIndicator && !initiallyChecked) {
       requiresBusyCycle = true;
@@ -161,8 +172,8 @@ function hasResultStateChanged(before, after) {
     || before.noResults !== after.noResults;
 }
 
-async function readResultState(page) {
-  return page.evaluate(({ cardSelector, noResultsSelector }) => {
+async function readResultState(page, filterSelector = "#filter_automatic") {
+  return page.evaluate(({ cardSelector, noResultsSelector, filterSelector }) => {
     const isVisible = (element) => {
       if (!element || element.hidden) {
         return false;
@@ -240,11 +251,12 @@ async function readResultState(page) {
       noResults: isVisible(document.querySelector(noResultsSelector)),
       hasBusyIndicator: Boolean(busyElement),
       busy: ["1", "true", "busy", "loading"].includes(busyValue),
-      filterChecked: document.getElementById("filter_automatic")?.checked === true
+      filterChecked: document.querySelector(filterSelector)?.checked === true
     };
   }, {
     cardSelector: CARD_SELECTOR,
-    noResultsSelector: NO_RESULTS_SELECTOR
+    noResultsSelector: NO_RESULTS_SELECTOR,
+    filterSelector
   });
 }
 
@@ -300,6 +312,8 @@ async function waitForNextPoll(page, deadlineAt, pollIntervalMs) {
 module.exports = {
   VipCarsReadinessError,
   applyAutomaticTransmissionFilter,
+  applySupplierFilter,
   loadSearchResultCards,
+  readResultState,
   waitForSearchOutcome
 };

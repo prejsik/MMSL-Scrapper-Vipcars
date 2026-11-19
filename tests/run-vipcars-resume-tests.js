@@ -78,6 +78,21 @@ async function main() {
     assert.equal(loadRunState(cooldownStatePath, resumeConfig, checkpointNow).cooldown.until, 0);
     console.log("PASS checkpoints without cooldown_until default to zero");
 
+    const leaderState = createRunState(resumeConfig, checkpointNow);
+    const row = leaderState.coverageRows[0];
+    const leaderKey = [row.pickup_date, row.dropoff_date, Number(row.duration_days), row.location].join("|");
+    saveRunState(cooldownStatePath, leaderState);
+    assert.equal(readJson(cooldownStatePath).full_pagination, undefined, "unused fallbacks keep the old format");
+    assert.equal(loadRunState(cooldownStatePath, resumeConfig, checkpointNow).fullPagination.size, 0);
+    leaderState.fullPagination.add(leaderKey);
+    saveRunState(cooldownStatePath, leaderState);
+    assert.deepEqual([...loadRunState(cooldownStatePath, resumeConfig, checkpointNow).fullPagination], [leaderKey]);
+    const unknownFallback = readJson(cooldownStatePath);
+    unknownFallback.full_pagination = ["2000-01-01|2000-01-03|2|Nowhere"];
+    writeJson(cooldownStatePath, unknownFallback);
+    assert.throws(() => loadRunState(cooldownStatePath, resumeConfig, checkpointNow), /full_pagination is invalid/);
+    console.log("PASS full-pagination fallbacks round-trip through the resume checkpoint");
+
     const validCooldownCheckpoint = clone(legacyCheckpoint);
     validCooldownCheckpoint.cooldown_until = 0;
     const invalidCooldowns = [

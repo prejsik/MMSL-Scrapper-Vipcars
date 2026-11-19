@@ -321,7 +321,7 @@ jobs:
           fi
 
           if [[ "$TRANSMISSION" == "automatic" ]]; then
-            command+=(--network-results)
+            command+=(--network-results --price-leaders)
           fi
 
           if [[ -n "$PICKUP_ROLLING_DAYS" ]]; then

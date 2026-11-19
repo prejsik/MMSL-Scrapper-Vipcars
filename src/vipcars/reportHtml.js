@@ -1,6 +1,7 @@
 const fs = require("fs");
 const path = require("path");
 const { sanitizeMessage } = require("./diagnostics");
+const { OWN_FILTER_SOURCE } = require("./priceLeaders");
 
 function escapeHtml(value) {
   return String(value ?? "")
@@ -274,6 +275,11 @@ function mmOfferSummary(offers) {
   }
 
   const offer = offers[rankIndex];
+  if (offer.source === OWN_FILTER_SOURCE) {
+    // Fetched through the supplier filter beyond the collected leaders: the price is exact,
+    // but uncollected competitors may be cheaper, so the rank stays unknown.
+    return { offer, rankLabel: "Poza czołówką", cheaperOffers: "Brak danych", state: "beyond-leaders", className: "mm" };
+  }
   const className = mmClassName(offer, offers);
   let state = "normal";
   if (className.includes("mm-top1-gap")) {
@@ -363,13 +369,15 @@ function buildScenarioTable(scenario, index, total) {
         <td class="coverage-state-cell" colspan="11">${buildCoverageStatus(presentation)}</td>
       </tr>`;
     }
+    // Top columns show only the verified sorted prefix, never an offer from the supplier filter.
+    const leaders = group.offers.filter((offer) => offer.source !== OWN_FILTER_SOURCE);
     return `${rowStart}
         <td class="index">${rowIndex}</td>
         <td>${escapeHtml(group.location)}${buildCoverageStatus(presentation)}</td>
-        ${buildOfferCells(group.offers, 0)}
-        ${buildOfferCells(group.offers, 1)}
-        ${buildOfferCells(group.offers, 2)}
-        ${buildOfferCells(group.offers, 3)}
+        ${buildOfferCells(leaders, 0)}
+        ${buildOfferCells(leaders, 1)}
+        ${buildOfferCells(leaders, 2)}
+        ${buildOfferCells(leaders, 3)}
         ${buildMmSummaryCells(mmSummary)}
       </tr>`;
   }).join("\n");
@@ -432,7 +440,9 @@ function reportSummary(scenarios) {
     locationCheckCount: locationGroups.length,
     missingMmCount: mmStates.filter((state) => state === "missing").length,
     closeMmCount: mmStates.filter((state) => state === "close").length,
-    top1GapCount: mmStates.filter((state) => state === "top1-gap").length
+    top1GapCount: mmStates.filter((state) => state === "top1-gap").length,
+    // Gap to the next-higher competitor is unknown here, so these are neither close nor normal.
+    beyondLeadersCount: mmStates.filter((state) => state === "beyond-leaders").length
   };
 }
 
@@ -473,6 +483,7 @@ function buildHtmlReport(rows, generatedAt = new Date().toISOString(), coverageR
     { value: "pending", text: "Oczekujące" },
     { value: "top1-gap", text: "Top1: przewaga ponad 2,5 EUR/d" },
     { value: "close", text: "Do 2,5 EUR/d od wyższej pozycji" },
+    { value: "beyond-leaders", text: "MM poza czołówką (pozycja nieznana)" },
     { value: "normal", text: "Pozostałe" }
   ]);
   return `<!doctype html>
@@ -647,7 +658,7 @@ function buildHtmlReport(rows, generatedAt = new Date().toISOString(), coverageR
 <body>
   <h1>VipCars report</h1>
   <div class="meta">Generated at: ${escapeHtml(generatedAt)} | Time zone: Europe/Warsaw | Source: https://www.vipcars.com</div>
-  <div class="summary">Scenariusze: ${summary.scenarioCount} | sprawdzenia lokalizacji: ${summary.locationCheckCount} | brak MM Cars Rental: ${summary.missingMmCount} | MM close: ${summary.closeMmCount} | MM top1 gap: ${summary.top1GapCount}${coverageSummary}</div>
+  <div class="summary">Scenariusze: ${summary.scenarioCount} | sprawdzenia lokalizacji: ${summary.locationCheckCount} | brak MM Cars Rental: ${summary.missingMmCount} | MM close: ${summary.closeMmCount} | MM top1 gap: ${summary.top1GapCount} | MM poza czołówką: ${summary.beyondLeadersCount}${coverageSummary}</div>
   ${coverageWarning}
   <div class="legend">
     <span><span class="badge">MM Cars Rental</span> MM Cars Rental in table</span>
